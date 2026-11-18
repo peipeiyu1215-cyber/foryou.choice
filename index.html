@@ -386,11 +386,12 @@ function startReturn(dot, glyph, gx, gy) {
   const horizontal = Math.abs(gx) > Math.abs(gy);
   const distance = horizontal ? Math.abs(point.x - dot.x) : Math.abs(point.y - dot.y);
   const acceleration = horizontal ? gx : gy;
-  const time = .94 * Math.sqrt(2 * distance / Math.abs(acceleration));
+  const time = Math.sqrt(2 * distance / Math.abs(acceleration));
   if (time < step) return;
   dot.vx = (point.x - dot.x) / time - gx * time / 2;
   dot.vy = (point.y - dot.y) / time - gy * time / 2;
-  dot.landing = {glyph, gx, gy, time};
+  dot.landing = {glyph, gx, gy, time, total: time, horizontal,
+    x: dot.x, y: dot.y, vx: dot.vx, vy: dot.vy};
   dot.flightX = dot.flightY = 0;
   dot.state = 'returning';
 }
@@ -403,13 +404,19 @@ function finishReturn(dot, dt) {
       state: 'fixed', anchor: landing.glyph, landing: null});
     return;
   }
-  const {gx, gy} = landing;
-  dot.x += (dot.vx + gx * dt / 2) * dt;
-  dot.y += (dot.vy + gy * dt / 2) * dt;
-  dot.vx += gx * dt;
-  dot.vy += gy * dt;
-  contain(dot);
   landing.time -= dt;
+  const elapsed = landing.total - landing.time;
+  const point = glyphs[landing.glyph].points[dot.id];
+  const release = smooth(ramp(elapsed / landing.total, .64, 1));
+  const arcX = landing.x + (landing.vx + landing.gx * elapsed / 2) * elapsed;
+  const arcY = landing.y + (landing.vy + landing.gy * elapsed / 2) * elapsed;
+  const x = landing.horizontal ? arcX : arcX + (point.x - arcX) * release;
+  const y = landing.horizontal ? arcY + (point.y - arcY) * release : arcY;
+  dot.vx = (x - dot.x) / dt;
+  dot.vy = (y - dot.y) / dt;
+  dot.x = x;
+  dot.y = y;
+  contain(dot);
 }
 
 function gravityDirection(degrees) {
@@ -477,16 +484,16 @@ function advanceManualAngle() {
 
 function update() {
   clock += step;
-  const motionActive = usingMotion && motionOffset !== null;
-  if (!motionActive) advanceManualAngle();
-  else if (viewportRotation() - calibrationScreen !== glyphScreenAngle) resize();
+  if (usingMotion && motionOffset !== null && motionTracks) {
+    updateHeldCore();
+    return;
+  }
+  advanceManualAngle();
 
   const clusteredCount = core ? stored.length :
     clusters.reduce((total, body) => total + body.members.length, 0);
   const quarterDistance = Math.abs(wrap(angle) % 180 - 90);
   const quarterBoost = 1 - smooth(ramp(quarterDistance, 4, 32));
-  const finishingMerge = motionActive && pendingMotionMerge && !core;
-  if (core) pendingMotionMerge = false;
   const quadrant = Math.floor(wrap(angle) / 90);
   const part = (wrap(angle) - quadrant * 90) / 90;
   const outward = quadrant % 2 === 0;
@@ -494,9 +501,11 @@ function update() {
   const towardCore = outward ? part : 1 - part;
   const openingRelease = .055 * smooth(ramp(towardCore, 0, 10 / 90)) *
     (1 - smooth(ramp(towardCore, 10 / 90, 27 / 90)));
-  const releaseLimit = finishingMerge ? 1 : Math.min(1, ramp(towardCore, 0, .83) + openingRelease);
+  const earlyRelease = .018 * smooth(ramp(towardCore, .08 / 90, 2 / 90)) *
+    (1 - smooth(ramp(towardCore, 4 / 90, 10 / 90)));
+  const releaseLimit = Math.min(1, ramp(towardCore, 0, .83) + openingRelease + earlyRelease);
   const gathering = outward ? arrivalDirection > 0 : arrivalDirection < 0;
-  const desiredStored = finishingMerge ? count : gathering
+  const desiredStored = gathering
     ? Math.floor(count * smooth(ramp(towardCore, .04, .72)))
     : Math.round(count * (1 - ramp(1 - towardCore, .035, .7)));
   const glyphDistance = (outward ? part : 1 - part) * 90;
@@ -505,10 +514,10 @@ function update() {
   const returnRate = 1 + 2.05 * smooth(landingProgress) - .7 * smooth(ramp(landingProgress, .8, 1));
   const returnSteps = Math.ceil(returnRate);
   const returnDt = step * returnRate / returnSteps;
-  const gravityAngle = motionActive ? angle + viewportRotation() - calibrationScreen : angle;
+  const gravityAngle = angle;
   const down = gravityDirection(gravityAngle);
   const gravityTarget = 1 + .23 * quarterBoost +
-    (finishingMerge ? 1.28 : !core && gathering ? 1.28 * smooth(ramp(towardCore, .06, .68)) : 0);
+    (!core && gathering ? 1.28 * smooth(ramp(towardCore, .06, .68)) : 0);
   motionGravity += (gravityTarget - motionGravity) * (1 - Math.exp(-step / .48));
   const acceleration = gravity * motionGravity;
   const gx = down.x * acceleration;
@@ -521,7 +530,7 @@ function update() {
     if (dot.state !== 'fixed' || (dot.anchor === glyph && dot.rank > releaseLimit)) continue;
     if (nextRelease > clock) break;
     release(dot);
-    nextRelease += .009;
+    nextRelease += .009 - .0025 * (1 - smooth(ramp(towardCore, 0, 10 / 90)));
   }
 
   if (clusteredCount > desiredStored && nextSpit <= clock) {
@@ -535,8 +544,8 @@ function update() {
 
   if (core) bounce(core, gx, gy, 0, true);
   const merging = !core && desiredStored > 0 &&
-    (finishingMerge || gy === 0 || gathering);
-  const nearMerge = finishingMerge || towardCore > .42;
+    (gy === 0 || gathering);
+  const nearMerge = towardCore > .42;
   const relaxed = nearMerge && clock - lastMerge > .16;
   const bodies = [...clusters];
   for (const dot of dots) {
@@ -560,7 +569,7 @@ function update() {
       if (canReturn && body.reachedTop) {
         startReturn(body, glyph, gx, gy);
         if (body.state === 'returning') break;
-      } else if (merging && nearMerge && (motionActive || Math.abs(gy) < Math.abs(gx) * .65)) rebounds.push(body);
+      } else if (merging && nearMerge && Math.abs(gy) < Math.abs(gx) * .65) rebounds.push(body);
     }
   }
   if (merging) {
@@ -604,6 +613,10 @@ function update() {
 
 function draw() {
   ctx.clearRect(0, 0, width, height);
+  if (usingMotion && motionOffset !== null && motionTracks) {
+    drawMotionTrack();
+    return;
+  }
   ctx.fillStyle = '#fff';
   ctx.beginPath();
   function circle(x, y, r) { ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, tau); }
@@ -640,12 +653,6 @@ function draw() {
     }
   }
   ctx.fill();
-  if (usingMotion && motionOffset !== null) {
-    const shown = (Math.round(wrap(angle) * 10) % 3600) / 10;
-    angleInput.value = shown;
-    readout.value = shown + '°';
-    return;
-  }
   const shown = target > 0 && wrap(target) === 0 ? 360 : wrap(target);
   if (document.activeElement !== angleInput || preview || usingMotion) angleInput.value = shown;
   const displayAngle = Math.round(angle);
@@ -687,8 +694,9 @@ function advancePreview() {
 }
 
 let usingMotion = false, motionOffset = null, lastRaw = null, sensorAngle = 0;
-let calibrationScreen = 0, pendingMotionMerge = false;
-let motionTurnDirection = 0, motionTurnExtreme = 0;
+let calibrationScreen = 0;
+let motionTracks = null, trackPromise = null, trackSize = null, savedManualAngle = 0;
+let heldCore = null, motionShift = null;
 function viewportRotation() {
   return window.screen?.orientation?.angle ?? window.orientation ?? 0;
 }
@@ -696,9 +704,7 @@ function viewportRotation() {
 function calibrateMotion(zero) {
   motionOffset = lastRaw === null ? null : sensorAngle - zero;
   calibrationScreen = viewportRotation();
-  pendingMotionMerge = false;
-  motionTurnDirection = 0;
-  motionTurnExtreme = zero;
+  heldCore = motionShift = null;
   target = zero;
   if (usingMotion) {
     angle = zero;
@@ -707,8 +713,9 @@ function calibrateMotion(zero) {
 }
 function manual() {
   stopPreview();
+  if (usingMotion) angle = target = savedManualAngle;
   usingMotion = false;
-  pendingMotionMerge = false;
+  heldCore = motionShift = null;
   if (glyphScreenAngle) resize();
   motionButton.textContent = '啟用陀螺儀';
   status.textContent = '拖曳畫面或使用角度滑桿，也可播放預覽';
@@ -747,6 +754,248 @@ stage.addEventListener('keydown', event => {
   target += event.key === 'ArrowRight' ? 15 : -15;
 });
 
+﻿function makeSensorTracks(data) {
+  ({width, height, gravity, glyphs} = data);
+  const tracks = [];
+  const transfers = [];
+
+  function capture(landingGlyph) {
+    const values = [];
+    let farthest = 0;
+    const add = (key, x, y, r, ink = 0) => values.push([key, x, y, r, ink]);
+    for (const body of core ? [...clusters, core] : clusters) {
+      const key = count + body.members[0].id;
+      const swallow = body.swallow;
+      if (!swallow || clock >= body.nextMerge) {
+        add(key, body.x, body.y, body.r);
+      } else {
+        const progress = smooth(1 - (body.nextMerge - clock) / mergeDuration);
+        add(key, body.x, body.y, swallow.previousRadius + (body.r - swallow.previousRadius) * progress);
+        const radius = swallow.radius * Math.sqrt(1 - progress);
+        add(key + count, clamp(body.x + swallow.x * (1 - progress), radius, width - radius),
+          clamp(body.y + swallow.y * (1 - progress), radius, height - radius), radius);
+      }
+    }
+    let fixed = 0;
+    for (const dot of dots) {
+      if (dot.state === 'stored') continue;
+      if (dot.state === 'fixed') fixed++;
+      else if (landingGlyph !== null) {
+        const point = glyphs[landingGlyph].points[dot.id];
+        farthest = Math.max(farthest, Math.hypot(dot.x - point.x, dot.y - point.y));
+      }
+      const anchor = dot.state === 'fixed' ? dot.anchor : dot.landing?.glyph;
+      const index = anchor ?? dot.departure?.glyph;
+      const spread = anchor === undefined
+        ? dot.departure ? 1 - smooth(clamp((clock - dot.departure.time) / .36, 0, 1)) : 0
+        : dot.state === 'returning' ? 1 - smooth(clamp(dot.landing.time / .4, 0, 1)) : 1;
+      const r = spread ? dot.r + (glyphs[index].points[dot.id].inkRadius - dot.r) * spread : dot.r;
+      add(dot.id, dot.x, dot.y, r, index === 1 ? -spread : spread);
+    }
+    values.sort((a, b) => a[0] - b[0]);
+    const packed = new Float32Array(values.flat());
+    transfers.push(packed.buffer);
+    return {raw: Math.abs(angle), fixed, farthest, packed};
+  }
+
+  for (const direction of [1, -1]) {
+    dots = data.dots.map(dot => Object.assign({...dot}, glyphs[0].points[dot.id], {
+      anchor: 0, state: 'fixed', vx: 0, vy: 0, departure: null, landing: null
+    }));
+    angle = target = arrivalDirection = turnVelocity = clock = nextRelease = nextSpit = lastMerge = 0;
+    motionGravity = 1;
+    core = null;
+    stored = [];
+    clusters = [];
+    const track = {frames: [], quarters: []};
+    for (let segment = 0; segment < 4; segment++) {
+      const start = segment * 90;
+      const goal = direction * (start + 90);
+      const opening = segment % 2 === 0;
+      const landingGlyph = opening ? null : (start + 90) % 360 / 180;
+      const frames = [capture(landingGlyph)];
+      let done = false;
+      for (let tick = 1; tick <= 120 * 65; tick++) {
+        const speed = opening ? 8 : 6.5;
+        target += direction * Math.min(Math.abs(goal - target), step * speed);
+        if (Math.abs(goal - target) < 1e-6) target = goal;
+        update();
+        done = angle === goal && (opening ? !!core && stored.length === count : completeGlyph((start + 90) % 360 / 180));
+        if (tick % 4 === 0 || done) frames.push(capture(landingGlyph));
+        if (done) break;
+      }
+      if (!done) throw new Error('Animation path could not reach ' + goal + '°');
+
+      const last = frames.length - 1;
+      let pivot = opening
+        ? frames.findIndex(frame => frame.raw >= start + 10)
+        : frames.findIndex(frame => frame.raw >= start + 80 && frame.fixed >= count - 22 &&
+          frame.fixed < count && frame.farthest <= Math.min(width, height) * .23);
+      pivot = clamp(pivot < 0 ? last - 1 : pivot, 1, last - 1);
+      const pivotDegrees = opening ? 10 : 80;
+      for (const [index, frame] of frames.entries()) {
+        if (segment && index === 0) continue;
+        const base = index <= pivot ? 0 : pivotDegrees;
+        const span = index <= pivot ? pivotDegrees : 90 - pivotDegrees;
+        let fraction = index <= pivot ? index / pivot : (index - pivot) / (last - pivot);
+        // Preserve the simulated gravity angle where possible while spreading out milestone waits.
+        if (opening || index <= pivot) {
+          const from = index <= pivot ? frames[0].raw : frames[pivot].raw;
+          const to = index <= pivot ? frames[pivot].raw : frames[last].raw;
+          const measured = ramp(frame.raw, from, to);
+          fraction = measured * .48 + fraction * .52;
+        }
+        frame.degrees = start + base + span * fraction;
+        track.frames.push(frame);
+      }
+      if (opening) track.quarters.push({
+        heading: start + 90, x: core.x, y: core.y, r: core.r,
+        vx: core.vx, vy: core.vy, flightX: core.flightX, flightY: core.flightY
+      });
+    }
+    tracks.push(track);
+  }
+  postMessage(tracks, transfers);
+}
+
+function prepareMotionTracks() {
+  const size = width + 'x' + height;
+  if (trackPromise && trackSize === size) return trackPromise;
+  trackSize = size;
+  const functions = [clamp, ramp, wrap, smooth, refreshMass, release, contain, bounceAxis, bounce,
+    mergePair, canMerge, spit, aimRebound, startReturn, finishReturn, gravityDirection, coreAtLowSide,
+    advanceManualAngle, update, completeGlyph, makeSensorTracks];
+  const local = {width, height, gravity, glyphs};
+  const source = 'const count=' + count + ',step=' + step + ',tau=' + tau +
+    ',mergeDuration=' + mergeDuration + ',usingMotion=false,preview=null;' +
+    'let width,height,gravity,glyphs,dots,angle,target,arrivalDirection,turnVelocity,' +
+    'clock,nextRelease,nextSpit,lastMerge,motionGravity,core,stored,clusters;' +
+    functions.map(fn => /^(clamp|ramp|wrap|smooth)$/.test(fn.name)
+      ? 'const ' + fn.name + '=' + fn.toString() + ';' : fn.toString()).join(String.fromCharCode(10)) +
+    String.fromCharCode(10) + 'self.onmessage=event=>makeSensorTracks(event.data);';
+  const request = new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(new Blob([source], {type: 'text/javascript'}));
+    const worker = new Worker(url);
+    function finish() {
+      worker.terminate();
+      URL.revokeObjectURL(url);
+    }
+    worker.onmessage = event => {
+      finish();
+      resolve({...local, tracks: event.data});
+    };
+    worker.onerror = event => {
+      finish();
+      reject(new Error(event.message || 'Unable to prepare bounce paths'));
+    };
+    worker.postMessage({...local, dots});
+  }).catch(error => {
+    if (trackPromise === request) trackPromise = null;
+    throw error;
+  });
+  trackPromise = request;
+  return request;
+}
+
+function motionFrame() {
+  const track = motionTracks.tracks[angle < 0 ? 1 : 0];
+  let degrees = wrap(Math.abs(angle));
+  const nearest = Math.round(degrees / 90) * 90;
+  if (Math.abs(nearest - degrees) < 1e-6) degrees = nearest;
+  const frames = track.frames;
+  let lo = 0, hi = frames.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (frames[mid].degrees <= degrees) lo = mid;
+    else hi = mid;
+  }
+  const a = frames[lo], b = frames[hi];
+  const fraction = clamp((degrees - a.degrees) / (b.degrees - a.degrees), 0, 1);
+  const quarter = track.quarters.find(item => Math.abs(item.heading - degrees) <= (heldCore ? .22 : .12));
+  return {a, b, degrees, fraction, quarter, track};
+}
+
+function updateHeldCore() {
+  const {quarter, degrees, track} = motionFrame();
+  if (!quarter) {
+    if (heldCore && track === heldCore.track) {
+      motionShift = {heading: heldCore.heading, track,
+        x: heldCore.x - heldCore.startX, y: heldCore.y - heldCore.startY};
+    }
+    heldCore = null;
+    if (motionShift && Math.abs(motionShift.heading - degrees) >= 13) motionShift = null;
+    return;
+  }
+  if (!heldCore || heldCore.heading !== quarter.heading || heldCore.track !== track) {
+    heldCore = {...quarter, track, startX: quarter.x, startY: quarter.y};
+    motionShift = null;
+  }
+  const down = gravityDirection(angle);
+  bounceAxis(heldCore, 'x', 'vx', motionTracks.width, down.x * motionTracks.gravity, true, 1, true, step);
+  bounceAxis(heldCore, 'y', 'vy', motionTracks.height, down.y * motionTracks.gravity, true, 1, false, step);
+}
+
+function drawMotionTrack() {
+  const {a, b, degrees, fraction, quarter, track} = motionFrame();
+  const rotation = viewportRotation() - calibrationScreen;
+  const sideways = rotation % 180 !== 0;
+  const w = motionTracks.width, h = motionTracks.height;
+  ctx.save();
+  ctx.translate(width / 2, height / 2);
+  ctx.rotate(-rotation * Math.PI / 180);
+  ctx.scale((sideways ? height : width) / w, (sideways ? width : height) / h);
+  ctx.translate(-w / 2, -h / 2);
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  function circle(x, y, r) {
+    const cx = clamp(x, r, w - r), cy = clamp(y, r, h - r);
+    ctx.moveTo(cx + r, cy);
+    ctx.arc(cx, cy, r, 0, tau);
+  }
+  if (quarter) {
+    const ball = heldCore?.track === track && heldCore.heading === quarter.heading ? heldCore : quarter;
+    circle(ball.x, ball.y, ball.r);
+  } else {
+    const first = a.packed, second = b.packed;
+    const shift = motionShift?.track === track ? 1 - smooth(ramp(Math.abs(motionShift.heading - degrees), 0, 13)) : 0;
+    const dx = shift ? motionShift.x * shift : 0;
+    const dy = shift ? motionShift.y * shift : 0;
+    const mix = (x, y) => x + (y - x) * fraction;
+    function dot(key, x, y, r, ink) {
+      x += dx; y += dy;
+      circle(x, y, r);
+      if (!ink || key >= count) return;
+      const glyph = motionTracks.glyphs[ink < 0 ? 1 : 0];
+      const point = glyph.points[key];
+      const spread = Math.abs(ink);
+      for (const accent of glyph.accents[key]) {
+        circle(x + (accent.x - point.x) * spread, y + (accent.y - point.y) * spread,
+          accent.inkRadius * spread);
+      }
+    }
+    let i = 0, j = 0;
+    while (i < first.length || j < second.length) {
+      const x = first[i] ?? Infinity, y = second[j] ?? Infinity;
+      if (x === y) {
+        dot(x, mix(first[i + 1], second[j + 1]), mix(first[i + 2], second[j + 2]),
+          mix(first[i + 3], second[j + 3]), mix(first[i + 4], second[j + 4]));
+        i += 5; j += 5;
+      } else if (x < y) {
+        if (fraction < .5) dot(x, first[i + 1], first[i + 2], first[i + 3], first[i + 4]);
+        i += 5;
+      } else {
+        if (fraction >= .5) dot(y, second[j + 1], second[j + 2], second[j + 3], second[j + 4]);
+        j += 5;
+      }
+    }
+  }
+  ctx.fill();
+  ctx.restore();
+  const shown = (Math.round(wrap(angle) * 10) % 3600) / 10;
+  angleInput.value = shown;
+  readout.value = shown + '°';
+}
+
 function orientation(event) {
   if (!Number.isFinite(event.beta) || !Number.isFinite(event.gamma)) return;
   const pitch = event.beta * Math.PI / 180, roll = event.gamma * Math.PI / 180;
@@ -759,25 +1008,8 @@ function orientation(event) {
   lastRaw = raw;
   if (!usingMotion) return;
   if (motionOffset === null) calibrateMotion(target);
-  const heading = sensorAngle - motionOffset;
-  const direction = Math.sign(heading - angle);
-  if (direction) {
-    const nextQuarter = direction > 0
-      ? Math.floor((angle + 90) / 180) * 180 + 90
-      : Math.ceil((angle - 90) / 180) * 180 - 90;
-    if (!core && direction * (heading - nextQuarter) >= 0) pendingMotionMerge = true;
-    // Sensor jitter must not switch the animation between merging and spitting.
-    const travel = heading - motionTurnExtreme;
-    if (!motionTurnDirection || travel * motionTurnDirection < -1) {
-      motionTurnDirection = Math.sign(travel);
-      motionTurnExtreme = heading;
-    } else if (travel * motionTurnDirection > 0) {
-      motionTurnExtreme = heading;
-    }
-    arrivalDirection = motionTurnDirection;
-  }
-  // One angle drives the readout, gravity and choreography in sensor mode.
-  angle = target = heading;
+  // The last event replaces the previous angle; frames never consume an angle queue.
+  angle = target = sensorAngle - motionOffset;
   status.textContent = '陀螺儀已啟用';
 }
 window.addEventListener('deviceorientation', orientation);
@@ -786,13 +1018,20 @@ motionButton.addEventListener('click', async () => {
   try {
     if (!window.DeviceOrientationEvent) throw new Error();
     if (typeof DeviceOrientationEvent.requestPermission === 'function' && await DeviceOrientationEvent.requestPermission() !== 'granted') throw new Error();
+    motionButton.disabled = true;
+    status.textContent = '正在準備彈跳路徑';
+    motionTracks = await prepareMotionTracks();
     stopPreview();
+    savedManualAngle = angle;
     usingMotion = true;
     calibrateMotion(angle);
     motionButton.textContent = '停用陀螺儀';
     status.textContent = '等待感應資料，請將裝置立起並轉動';
-  } catch {
-    status.textContent = '無法取得感應權限，可使用滑桿或拖曳';
+  } catch (error) {
+    console.error(error);
+    status.textContent = '無法啟用感應，可使用滑桿或拖曳';
+  } finally {
+    motionButton.disabled = false;
   }
 });
 document.querySelector('#zero').addEventListener('click', () => {
@@ -806,6 +1045,10 @@ resize();
 new ResizeObserver(() => {
   if (stage.clientWidth !== width || stage.clientHeight !== height) resize();
 }).observe(stage);
+// Build paths off the UI thread so motion can start promptly after permission.
+if (window.navigator?.maxTouchPoints > 0 && window.DeviceOrientationEvent && window.Worker) {
+  setTimeout(() => { prepareMotionTracks().catch(() => {}); }, 300);
+}
 let previous = performance.now(), accumulated = 0;
 function frame(now) {
   accumulated += clamp((now - previous) / 1000, 0, .055);
