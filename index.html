@@ -2,1058 +2,819 @@
 <html lang="zh-Hant">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>選擇｜彈力球逐點掉落</title>
+<title>選擇｜大點自由彈跳版</title>
 <style>
 *{box-sizing:border-box}
-body{margin:0;height:100dvh;background:#000;color:white;font:15px system-ui,sans-serif;overflow:hidden}
-canvas{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;cursor:grab}canvas:active{cursor:grabbing}
-footer{position:fixed;inset:auto 0 0;display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:8px 12px;padding:8px max(10px,env(safe-area-inset-right)) max(8px,env(safe-area-inset-bottom)) max(10px,env(safe-area-inset-left));background:rgba(20,21,24,.56)}
-label{display:flex;align-items:center;gap:8px;flex:1 1 190px;max-width:410px}input{flex:1;min-width:0;accent-color:#fff}output{min-width:5ch;text-align:right;font-variant-numeric:tabular-nums}button{background:#27282e;color:#fff;border:1px solid #62646b;border-radius:6px;padding:7px 10px;font:inherit}small{color:#ccc;text-align:center}button:focus-visible,canvas:focus-visible{outline:2px solid white;outline-offset:-2px}
+body{margin:0;background:#000;color:#fff;font:15px system-ui,sans-serif;overflow:hidden}
+canvas{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;cursor:grab}
+canvas:active{cursor:grabbing}
+footer{position:fixed;inset:auto 0 0;display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:8px 12px;padding:8px max(10px,env(safe-area-inset-right)) max(8px,env(safe-area-inset-bottom)) max(10px,env(safe-area-inset-left));background:#151518a6}
+label{display:flex;align-items:center;gap:8px;flex:1 1 185px;max-width:435px}
+input{flex:1;min-width:0;accent-color:#fff}
+output{min-width:5ch;text-align:right;font-variant-numeric:tabular-nums}
+button{background:#27282e;color:#fff;border:1px solid #666871;border-radius:6px;padding:8px 10px;font:inherit}
+small{color:#ddd;text-align:center}
+button:focus-visible,canvas:focus-visible{outline:2px solid white;outline-offset:-2px}
 </style>
 <main>
-  <canvas id="stage" tabindex="0" aria-label="全螢幕彈力球動畫，拖曳或按左右方向鍵旋轉重力方向"></canvas>
+  <canvas id="stage" tabindex="0" aria-label="選擇，大點自由彈跳互動。拖曳或按左右方向鍵改變角度"></canvas>
 </main>
 <footer>
-<label>角度 <input id="angle" type="range" min="0" max="360" step="0.1" value="0"><output id="readout">0°</output></label>
-<button id="play" type="button">播放預覽</button><button id="motion" type="button">啟用陀螺儀</button><button id="zero" type="button">校正 0°</button>
-<small id="status" role="status">拖曳畫面或使用角度滑桿，也可播放預覽</small>
+  <label>角度 <input id="angle" type="range" min="0" max="360" step="0.1" value="0"><output id="readout">0°</output></label>
+  <button id="play" type="button">播放預覽</button>
+  <button id="motion" type="button" aria-pressed="false">啟用陀螺儀</button>
+  <button id="zero" type="button">校正 0°</button>
+  <small id="status" role="status">拖曳畫面、使用滑桿，或播放預覽</small>
 </footer>
 <script>
 'use strict';
 const stage = document.querySelector('#stage');
 const ctx = stage.getContext('2d');
-const angleInput = document.querySelector('#angle');
+const slider = document.querySelector('#angle');
 const readout = document.querySelector('#readout');
-const playButton = document.querySelector('#play');
-const motionButton = document.querySelector('#motion');
+const play = document.querySelector('#play');
+const motion = document.querySelector('#motion');
 const status = document.querySelector('#status');
-const count = 246;
+const sentences = [['我們都', '決定好了'], ['你就該', '完成', '我的夢想']];
+const dotCount = 1050;
+const mergeTime = .18;
+const maxGroupSize = 14;
+const minMovingBodies = 78;
+const releaseEnd = 7.4;
+const returnSpan = 20;
 const step = 1 / 120;
+const bouncePace = .84;
 const tau = 2 * Math.PI;
-const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
-const ramp = (n, start, end) => clamp((n - start) / (end - start), 0, 1);
-const wrap = n => ((n % 360) + 360) % 360;
-const smooth = t => t * t * (3 - 2 * t);
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+const range = (value, min, max) => clamp((value - min) / (max - min), 0, 1);
+const smooth = value => value * value * (3 - 2 * value);
+const wrap = value => ((value % 360) + 360) % 360;
+const lerp = (a, b, progress) => a + (b - a) * progress;
+
 function random(seed) {
   return () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296);
 }
 
-const rng = random(9347);
-const dots = Array.from({length: count}, (_, id) => ({
-  id, size: .65 + 1.42 * rng() ** 1.5, rank: rng(), direction: rng() * tau,
-  state: 'fixed', anchor: 0, vx: 0, vy: 0
-}));
-dots.sort((a, b) => a.rank - b.rank).forEach((dot, i) => { dot.rank = (i + 1) / count; });
-let width, height, scale, unit, gravity, glyphs, glyphScreenAngle;
-let turnVelocity = 0, motionGravity = 1;
-let target = 0, angle = 0, arrivalDirection = 0, preview = null, pausedPreview = null;
-let core = null, stored = [], clusters = [];
-let lastMerge = 0;
-const mergeDuration = .086;
-let clock = 0, nextRelease = 0, nextSpit = 0;
+let width, height, viewWidth, viewHeight, scale, glyphs, balls = [], groups = [];
+let angle = 0, appliedAngle = 0, direction = 1, settledAt = 0;
+let preview = null, drag = null, physicsTime = 0;
+let usingMotion = false, calibrationScreen = screenRotation();
+let lastRaw = null, unwrapped = 0, zero = 0, filtered = null;
+let lastSensorTime = 0, lastEvent = 0;
 
-function makeGlyph(index) {
-  const lines = [['我們都', '決定好了'], ['你就該', '完成', '我的夢想']][index];
-  const font = '400 FONTpx "DFKai-SB", "STKaiti", "Kaiti TC", KaiTi, "Microsoft JhengHei", serif';
-  const tracking = 1.08;
-  const sideways = glyphScreenAngle % 180 !== 0;
-  const textWidth = sideways ? height : width;
-  const textHeight = sideways ? width : height;
+function screenRotation() {
+  return window.screen?.orientation?.angle ?? window.orientation ?? 0;
+}
+
+function viewRotation() {
+  if (!usingMotion) return 0;
+  return Math.round((screenRotation() - calibrationScreen) / 90) * 90;
+}
+
+function gravityDirection(degrees) {
+  const radians = wrap(degrees) * Math.PI / 180;
+  const x = Math.sin(radians), y = Math.cos(radians);
+  return {x: Math.abs(x) < 1e-9 ? 0 : x, y: Math.abs(y) < 1e-9 ? 0 : y};
+}
+
+function gravityStrength() {
+  // Scaling acceleration by pace squared slows the wall launch by pace at the same height.
+  return Math.min(width, height) * .91 * bouncePace ** 2;
+}
+
+function glyphPoints(index) {
+  const lines = sentences[index];
+  const tracking = 1.10, leading = 1.16;
   const columns = Math.max(...lines.map(line => line.length));
-  const fontSize = Math.min(textWidth * .94 / (columns * tracking), textHeight * .8 / lines.length, 170);
+  const size = Math.min(width * .94 / (columns * tracking), height * .78 / (lines.length * leading), 185);
   const mask = document.createElement('canvas');
   mask.width = Math.ceil(width);
   mask.height = Math.ceil(height);
   const ink = mask.getContext('2d', {willReadFrequently: true});
   ink.translate(width / 2, height / 2);
-  ink.rotate(-glyphScreenAngle * Math.PI / 180);
-  ink.font = font.replace('FONT', fontSize);
+  if (index === 1) ink.rotate(Math.PI);
+  ink.font = '400 ' + size + 'px "DFKai-SB", "STKaiti", "Kaiti TC", KaiTi, "Microsoft JhengHei", serif';
   ink.textAlign = 'center';
   ink.textBaseline = 'alphabetic';
   ink.lineJoin = 'round';
-  ink.lineWidth = Math.max(.55, fontSize * .016);
-  for (const [i, line] of lines.entries()) {
+  ink.lineWidth = Math.max(.55, size * .016);
+  for (const [row, line] of lines.entries()) {
     const metrics = ink.measureText(line);
-    const center = (i - (lines.length - 1) / 2) * fontSize * 1.14;
-    const baseline = center + (metrics.actualBoundingBoxAscent - metrics.actualBoundingBoxDescent) / 2;
+    const baseline = (row - (lines.length - 1) / 2) * size * leading +
+      (metrics.actualBoundingBoxAscent - metrics.actualBoundingBoxDescent) / 2;
     for (const [column, character] of Array.from(line).entries()) {
-      const x = (column - (line.length - 1) / 2) * fontSize * tracking;
+      const x = (column - (line.length - 1) / 2) * size * tracking;
       ink.strokeText(character, x, baseline);
       ink.fillText(character, x, baseline);
     }
   }
+
   const pixels = ink.getImageData(0, 0, mask.width, mask.height).data;
-  const rand = random(8129 + index * 101);
+  const rng = random(8179 + index * 1049);
   const candidates = [];
-  const density = Math.min(1, 3700 / (fontSize ** 2));
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
+  const stride = Math.max(1, Math.round(size / 59));
+  for (let y = 1; y < height - 1; y += stride) {
+    for (let x = 1 + Math.floor(y / stride) % stride; x < width - 1; x += stride) {
       const alpha = pixels[(y * mask.width + x) * 4 + 3];
-      if (alpha > 75 && rand() < density) {
-        candidates.push({x: x + .5, y: y + .5, distance: Infinity,
-          strokeWeight: .72 + .28 * alpha / 255});
-      }
+      if (alpha >= 102) candidates.push({x: x + .5, y: y + .5, weight: .75 + .25 * alpha / 255, distance: Infinity});
     }
   }
   const points = [];
-  let best = candidates[Math.floor(rand() * candidates.length)];
-  while (best && points.length < Math.round(count * 2.05)) {
-    points.push(best);
-    const chosen = best;
-    best = null;
-    let score = 0;
+  let chosen = candidates[Math.floor(rng() * candidates.length)];
+  while (chosen && points.length < dotCount) {
+    points.push({x: chosen.x, y: chosen.y});
+    let next = null, score = 0;
     for (const point of candidates) {
       const dx = chosen.x - point.x, dy = chosen.y - point.y;
       point.distance = Math.min(point.distance, dx * dx + dy * dy);
-      const value = point.distance * point.strokeWeight;
-      if (value > score) { best = point; score = value; }
+      const value = point.distance * point.weight;
+      if (value > score) { score = value; next = point; }
     }
+    chosen = next;
   }
-  // Fill gaps along ink strokes with smaller dots that travel with their nearest particle.
-  const gap = Math.max(2.45, fontSize * .034);
-  const minGap = gap * .79;
-  const grid = new Map();
-  function addStrokeDot(point) {
-    const key = Math.floor(point.x / gap) + ':' + Math.floor(point.y / gap);
-    if (grid.has(key)) grid.get(key).push(point);
-    else grid.set(key, [point]);
-  }
-  for (const point of points) addStrokeDot(point);
-  for (let row = 1; (row + .5) * gap < height - 1; row++) {
-    const y = (row + .5) * gap;
-    for (let x = gap * (row % 2 ? 1 : .5); x < width - 1; x += gap) {
-      if (pixels[(Math.floor(y) * mask.width + Math.floor(x)) * 4 + 3] < 105) continue;
-      const col = Math.floor(x / gap);
-      let clear = true;
-      for (let dy = -1; dy <= 1 && clear; dy++) {
-        for (let dx = -1; dx <= 1 && clear; dx++) {
-          const nearby = grid.get((col + dx) + ':' + (row + dy));
-          clear = !nearby?.some(point => (point.x - x) ** 2 + (point.y - y) ** 2 < minGap ** 2);
-        }
-      }
-      if (!clear) continue;
-      const point = {x, y};
-      points.push(point);
-      addStrokeDot(point);
-    }
-  }
-  // Keep a thin gap between neighboring ink dots, including around dense stroke junctions.
-  for (const point of points) {
-    let nearest = Infinity;
-    for (const other of points) {
-      if (other === point) continue;
-      nearest = Math.min(nearest, (point.x - other.x) ** 2 + (point.y - other.y) ** 2);
-    }
-    point.inkRadius = Math.min(fontSize * .038, Math.sqrt(nearest) * .458);
-  }
-  const accents = Array.from({length: count}, () => []);
-  for (const accent of points.splice(count)) {
-    let bestIndex = 0, distance = Infinity;
-    for (const [index, point] of points.entries()) {
-      const gap = (point.x - accent.x) ** 2 + (point.y - accent.y) ** 2;
-      if (gap < distance) { bestIndex = index; distance = gap; }
-    }
-    accents[bestIndex].push(accent);
-  }
-  const samples = points.length;
-  while (points.length < count) points.push(points[points.length % samples] ||
-    {x: width / 2, y: height / 2, inkRadius: .6});
-  for (let i = points.length - 1; i > 0; i--) {
-    const j = Math.floor(rand() * (i + 1));
-    [points[i], points[j]] = [points[j], points[i]];
-    [accents[i], accents[j]] = [accents[j], accents[i]];
-  }
-  const spacing = points.map((point, i) => {
-    let nearest = Infinity;
-    for (let j = 0; j < points.length; j++) {
-      if (i === j) continue;
-      const dx = point.x - points[j].x, dy = point.y - points[j].y;
-      nearest = Math.min(nearest, dx * dx + dy * dy);
-    }
-    return Math.sqrt(nearest);
-  });
-  if (index === 1) {
-    // The canvas is the device's screen. After a half turn both screen axes invert.
-    for (const point of new Set([...points, ...accents.flat()])) {
-      point.x = width - point.x;
-      point.y = height - point.y;
-    }
-  }
-  return {points, spacing, accents, fontSize};
+  return {points, size};
 }
 
-function refreshMass(body) {
-  body.mass = body.members.reduce((total, dot) => total + dot.mass, 0);
-  body.r = Math.sqrt(body.mass);
+function buildGlyphs() {
+  const first = glyphPoints(0), second = glyphPoints(1);
+  const available = Math.min(first.points.length, second.points.length);
+  const count = balls.length || available;
+  for (const glyph of [first, second]) {
+    if (!glyph.points.length) glyph.points.push({x: width / 2, y: height / 2});
+    const points = glyph.points.slice();
+    glyph.points = Array.from({length: count}, (_, i) => points[i % points.length]);
+    // Matching by reading order keeps the last flight local on both orientations.
+    glyph.points.sort((a, b) => a.y - b.y || a.x - b.x);
+  }
+  return [first, second];
+}
+
+function makeBalls() {
+  const rng = random(80291);
+  const count = glyphs[0].points.length;
+  const order = Array.from({length: count}, (_, id) => id);
+  for (let i = count - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  const rank = new Array(count);
+  order.forEach((id, i) => { rank[id] = (i + 1) / count; });
+  const unit = clamp(Math.min(...glyphs.map(glyph => glyph.size)) * .0155, 1.14, 2.55);
+  const spacing = glyphs.map(glyph => glyph.points.map((point, id) => {
+    let nearest = Infinity;
+    for (const [otherId, other] of glyph.points.entries()) {
+      if (id !== otherId) nearest = Math.min(nearest, (point.x - other.x) ** 2 + (point.y - other.y) ** 2);
+    }
+    return Math.sqrt(nearest);
+  }));
+  return glyphs[0].points.map((point, id) => {
+    const pick = rng(), power = rng();
+    const band = pick < .30 ? 'low' : pick < .73 ? 'medium' : 'high';
+    const rebound = band === 'low' ? lerp(.14, .33, power)
+      : band === 'medium' ? lerp(.38, .77, power) : lerp(1.04, 1.51, power);
+    const preferred = unit * lerp(.83, 1.44, rng());
+    const room = Math.min(spacing[0][id], spacing[1][id]) * .49;
+    const r = Math.min(preferred, Math.max(room, unit * .8));
+    return {
+      id, x: point.x, y: point.y, vx: 0, vy: 0, r,
+      band, rebound, spring: lerp(.75, .88, rng()), drift: lerp(-.2, .2, rng()),
+      bounceNoise: random(50789 + id * 7919),
+      release: .13 + (releaseEnd - .13) * rank[id] ** .72,
+      arrive: lerp(.32, 1, rank[id] ** .88),
+      begin: lerp(.015, .68, rng()),
+      hop: rng() < .34 ? lerp(.7, 1.65, rng()) : 0,
+      state: 'fixed', anchor: 0, route: null, impacts: 0, nextContact: 0, emission: null
+    };
+  });
+}
+
+function keepInside(ball) {
+  ball.x = clamp(ball.x, ball.r, width - ball.r);
+  ball.y = clamp(ball.y, ball.r, height - ball.r);
 }
 
 function resize() {
-  const oldWidth = width, oldHeight = height;
-  width = Math.max(1, stage.clientWidth);
-  height = Math.max(1, stage.clientHeight);
+  const previousWidth = width, previousHeight = height;
+  viewWidth = stage.clientWidth;
+  viewHeight = stage.clientHeight;
+  if (viewWidth < 12 || viewHeight < 12) return;
+  const sideways = viewRotation() % 180 !== 0;
+  width = sideways ? viewHeight : viewWidth;
+  height = sideways ? viewWidth : viewHeight;
   scale = Math.min(window.devicePixelRatio || 1, 2);
-  stage.width = Math.round(width * scale);
-  stage.height = Math.round(height * scale);
-  ctx.setTransform(scale, 0, 0, scale, 0, 0);
-  glyphScreenAngle = usingMotion ? viewportRotation() - calibrationScreen : 0;
-  glyphs = [makeGlyph(0), makeGlyph(1)];
-  unit = Math.min(glyphs[0].fontSize, glyphs[1].fontSize) / 22;
-  gravity = Math.min(width, height) * .4;
-  for (const dot of dots) {
-    // Use one radius throughout the motion, sized to keep dots distinct in both glyphs.
-    const spacing = Math.min(...glyphs.map(glyph => glyph.spacing[dot.id]));
-    dot.r = Math.min(unit * dot.size, Math.max(.78, spacing * .485));
-    dot.mass = dot.r ** 2;
-    if (dot.state === 'fixed') Object.assign(dot, glyphs[dot.anchor].points[dot.id]);
-    else if (oldWidth) { dot.x *= width / oldWidth; dot.y *= height / oldHeight; }
+  stage.width = Math.round(viewWidth * scale);
+  stage.height = Math.round(viewHeight * scale);
+  if (width === previousWidth && height === previousHeight) return;
+  glyphs = buildGlyphs();
+  if (!balls.length) {
+    balls = makeBalls();
+    return;
   }
-  if (oldWidth) for (const body of core ? [...clusters, core] : clusters) {
-    body.x *= width / oldWidth;
-    body.y *= height / oldHeight;
-    refreshMass(body);
-    body.swallow = null;
-    contain(body);
+  for (const group of groups) {
+    group.x *= width / previousWidth;
+    group.y *= height / previousHeight;
+    group.vx *= width / previousWidth;
+    group.vy *= height / previousHeight;
+    group.route = null;
+    group.swallow = null;
+    keepInside(group);
   }
-  for (const dot of dots) if (dot.state === 'returning') {
-    dot.state = 'free';
-    dot.landing = null;
-  }
-  for (const dot of dots) if (dot.state === 'free') contain(dot);
-}
-
-function release(dot) {
-  dot.departure = {glyph: dot.anchor, time: clock};
-  dot.state = 'free';
-  dot.flightX = dot.flightY = 0;
-  dot.reachedTop = false;
-  dot.vx = Math.cos(dot.direction) * 13;
-  dot.vy = Math.sin(dot.direction) * 13;
-}
-
-function contain(body) {
-  body.x = clamp(body.x, body.r, width - body.r);
-  body.y = clamp(body.y, body.r, height - body.r);
-}
-
-function bounceAxis(body, position, velocity, extent, acceleration, free, damping, primary, dt) {
-  const min = body.r, max = extent - body.r;
-  const low = acceleration < 0 ? min : max;
-  const high = acceleration < 0 ? max : min;
-  const gravitySign = Math.sign(acceleration);
-  const flight = position === 'x' ? 'flightX' : 'flightY';
-  if (body[flight] !== gravitySign) body[flight] = 0;
-  const previous = body[velocity];
-  let speed = previous;
-  if (free && speed * gravitySign < 0 && body[flight] === gravitySign) {
-    // Recompute just enough energy to reach the wall as gravity and radius change.
-    const required = Math.sqrt(2 * Math.abs(acceleration) * Math.max(0, Math.abs(body[position] - high) - .35));
-    speed = gravitySign * -required;
-  }
-  const next = (speed + acceleration * dt) * damping;
-  const location = body[position] + (speed + next) * dt / 2;
-  body[position] = clamp(location, min, max);
-  body[velocity] = next;
-
-  if (free && gravitySign) {
-    if (primary && body[flight] === gravitySign && previous * gravitySign < 0 && Math.abs(body[position] - high) < 1) {
-      body.reachedTop = true;
-    }
-    if (body[position] === low && next * gravitySign > 0) {
-      body[flight] = gravitySign;
-      body[velocity] = -gravitySign * Math.sqrt(2 * Math.abs(acceleration) * Math.max(0, max - min - .35));
-      return true;
-    }
-  }
-  if ((location < min && next < 0) || (location > max && next > 0)) {
-    body[velocity] *= free ? -1 : -.65;
-  }
-}
-
-function bounce(body, ax, ay, damping = 0, free = false, dt = step) {
-  const decay = Math.exp(-damping * dt);
-  const horizontal = Math.abs(ax) >= Math.abs(ay);
-  const reboundX = bounceAxis(body, 'x', 'vx', width, ax, free, decay, horizontal, dt);
-  const reboundY = bounceAxis(body, 'y', 'vy', height, ay, free, decay, !horizontal, dt);
-  const mainRebound = horizontal ? reboundX : reboundY;
-  if (mainRebound && ax && ay) {
-    // Lean the outgoing path toward the current up direction at wall contact.
-    if (horizontal) {
-      body.vy = .5 * (body.vy + body.vx * ay / ax);
-      body.flightY = 0;
+  for (const ball of balls) {
+    if (ball.state === 'absorbed') continue;
+    if (ball.state === 'fixed') {
+      const point = glyphs[ball.anchor].points[ball.id];
+      ball.x = point.x;
+      ball.y = point.y;
     } else {
-      body.vx = .5 * (body.vx + body.vy * ax / ay);
-      body.flightX = 0;
+      ball.x *= width / previousWidth;
+      ball.y *= height / previousHeight;
+      ball.vx *= width / previousWidth;
+      ball.vy *= height / previousHeight;
+      if (ball.state === 'returning') ball.route = null;
     }
+    keepInside(ball);
   }
-  return mainRebound;
 }
 
-function mergePair(a, b) {
-  const receiver = a.mass >= b.mass ? a : b;
-  const incoming = receiver === a ? b : a;
-  const members = [...(receiver.members || [receiver]), ...(incoming.members || [incoming])];
-  const share = incoming.mass / (receiver.mass + incoming.mass);
-  const body = {
-    x: receiver.x, y: receiver.y,
-    vx: receiver.vx + (incoming.vx - receiver.vx) * share,
-    vy: receiver.vy + (incoming.vy - receiver.vy) * share,
-    flightX: receiver.flightX, flightY: receiver.flightY,
-    reachedTop: true, members, nextMerge: clock + mergeDuration,
-    swallow: {x: incoming.x - receiver.x, y: incoming.y - receiver.y,
-      radius: incoming.r, previousRadius: receiver.r}
+function fall(ball) {
+  ball.state = 'free';
+  ball.route = null;
+  ball.impacts = 0;
+}
+
+function wallImpact(ball, axis, sign, acceleration, force) {
+  const velocity = axis === 'x' ? 'vx' : 'vy';
+  const tangent = axis === 'x' ? 'vy' : 'vx';
+  const extent = axis === 'x' ? width : height;
+  const incoming = Math.abs(ball[velocity]);
+  const floor = sign * acceleration > 0 && force > 0
+    ? smooth(range(Math.abs(acceleration) / force, .30, .70)) : 0;
+  ball.impacts++;
+  const vary = ball.bounceNoise();
+  const restitution = clamp(.875 + (ball.spring - .75) * .75 + (vary - .5) * .065, .855, .981);
+  let rebound = incoming * restitution;
+  if (floor) {
+    const energy = 2 * Math.abs(acceleration) * (extent - 2 * ball.r);
+    const peak = Math.min(1.62, ball.rebound * lerp(.82, 1.22, vary));
+    const replenished = Math.sqrt(energy * peak);
+    rebound += floor * Math.max(0, replenished - rebound);
+    const sidewaysKick = ball.drift * .24 + (ball.bounceNoise() - .5) * .36;
+    ball[tangent] += floor * rebound * sidewaysKick;
+  }
+  ball[velocity] = -sign * rebound;
+}
+
+function timeToWall(position, speed, acceleration, wall, side, duration) {
+  const distance = wall - position;
+  if (side * (position + (speed + acceleration * duration / 2) * duration - wall) < 0) {
+    if (Math.abs(acceleration) < 1e-9) return Infinity;
+    const turn = -speed / acceleration;
+    if (turn <= 0 || turn >= duration ||
+        side * (position + (speed + acceleration * turn / 2) * turn - wall) < 0) return Infinity;
+  }
+  if (Math.abs(acceleration) < 1e-9) {
+    if (side * speed <= 0) return Infinity;
+    const time = distance / speed;
+    return time >= -1e-9 && time <= duration + 1e-9 ? clamp(time, 0, duration) : Infinity;
+  }
+  const squared = speed * speed + 2 * acceleration * distance;
+  if (squared < 0 || (squared === 0 && side * acceleration <= 0)) return Infinity;
+  const impactSpeed = side * Math.sqrt(squared);
+  const sum = speed + impactSpeed;
+  const time = Math.abs(sum) > 1e-8 ? 2 * distance / sum : (impactSpeed - speed) / acceleration;
+  return time >= -1e-9 && time <= duration + 1e-9 ? clamp(time, 0, duration) : Infinity;
+}
+
+function advanceBall(ball, gx, gy, force, dt) {
+  // Advance to actual contact first, then use the remaining time for the rebound.
+  for (let remaining = dt, contacts = 0; remaining > 1e-8 && contacts < 5; contacts++) {
+    const left = timeToWall(ball.x, ball.vx, gx, ball.r, -1, remaining);
+    const right = timeToWall(ball.x, ball.vx, gx, width - ball.r, 1, remaining);
+    const top = timeToWall(ball.y, ball.vy, gy, ball.r, -1, remaining);
+    const bottom = timeToWall(ball.y, ball.vy, gy, height - ball.r, 1, remaining);
+    const hit = Math.min(left, right, top, bottom);
+    const travel = Math.min(hit, remaining);
+    ball.x += (ball.vx + gx * travel / 2) * travel;
+    ball.y += (ball.vy + gy * travel / 2) * travel;
+    ball.vx += gx * travel;
+    ball.vy += gy * travel;
+    remaining -= travel;
+    if (hit === Infinity) break;
+    if (Math.abs(Math.min(left, right) - hit) < 1e-8) {
+      const sign = left <= right ? -1 : 1;
+      ball.x = sign < 0 ? ball.r : width - ball.r;
+      wallImpact(ball, 'x', sign, gx, force);
+    }
+    if (Math.abs(Math.min(top, bottom) - hit) < 1e-8) {
+      const sign = top <= bottom ? -1 : 1;
+      ball.y = sign < 0 ? ball.r : height - ball.r;
+      wallImpact(ball, 'y', sign, gy, force);
+    }
+    // Treat a zero-speed contact under tiny tangential gravity as a resting axis.
+    if (travel < 1e-8) {
+      if (Math.abs(ball.vx) < 1e-8 && ((ball.x === ball.r && gx < 0) ||
+          (ball.x === width - ball.r && gx > 0))) gx = 0;
+      if (Math.abs(ball.vy) < 1e-8 && ((ball.y === ball.r && gy < 0) ||
+          (ball.y === height - ball.r && gy > 0))) gy = 0;
+    }
+  }
+  keepInside(ball);
+}
+
+function collidePair(a, b, down) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const extent = a.r + b.r;
+  const distanceSquared = dx * dx + dy * dy;
+  if (distanceSquared >= extent * extent || distanceSquared < 1e-9) return;
+  const distance = Math.sqrt(distanceSquared);
+  const nx = dx / distance, ny = dy / distance;
+  // Glancing contacts add variety without turning the dense floor layer into a pile.
+  if (Math.abs(nx * down.x + ny * down.y) > .48) return;
+  const aWeight = b.r ** 2 / (a.r ** 2 + b.r ** 2);
+  const bWeight = 1 - aWeight;
+  const separation = (extent - distance) * .44;
+  a.x -= nx * separation * aWeight;
+  a.y -= ny * separation * aWeight;
+  b.x += nx * separation * bWeight;
+  b.y += ny * separation * bWeight;
+  keepInside(a);
+  keepInside(b);
+  const approaching = (a.vx - b.vx) * nx + (a.vy - b.vy) * ny;
+  if (approaching <= 0) return;
+  const impulse = 1.89 * approaching;
+  a.nextContact = b.nextContact = physicsTime + .21;
+  a.vx -= impulse * nx * aWeight;
+  a.vy -= impulse * ny * aWeight;
+  b.vx += impulse * nx * bWeight;
+  b.vy += impulse * ny * bWeight;
+}
+
+﻿function mergeBodies(first, second) {
+  const a = first.r >= second.r ? first : second;
+  const b = a === first ? second : first;
+  const aMass = a.mass ?? a.r ** 2, bMass = b.mass ?? b.r ** 2;
+  const mass = aMass + bMass, weight = bMass / mass;
+  const members = [...(a.members || [a]), ...(b.members || [b])];
+  const group = {
+    id: a.id, x: a.x, y: a.y, r: Math.sqrt(mass), mass, members, emissions: [],
+    vx: lerp(a.vx, b.vx, weight), vy: lerp(a.vy, b.vy, weight),
+    rebound: a.rebound, drift: lerp(a.drift, b.drift, weight), spring: lerp(a.spring, b.spring, weight),
+    bounceNoise: a.bounceNoise, impacts: Math.max(a.impacts, b.impacts),
+    begin: (Math.imul(a.id + 13, 2654435761) >>> 0) / 4294967296 * .7 + .018,
+    hop: .45, state: 'free', route: null, nextContact: physicsTime + mergeTime,
+    swallow: {mass: aMass, incoming: bMass, x: b.x - a.x, y: b.y - a.y, until: physicsTime + mergeTime}
   };
-  refreshMass(body);
-  contain(body);
-  for (const dot of members) dot.state = 'stored';
-  clusters = clusters.filter(cluster => cluster !== a && cluster !== b);
-  if (members.length === count) {
-    core = body;
-    stored = members;
-  } else clusters.push(body);
-  lastMerge = clock;
+  for (const body of [a, b]) {
+    body.state = 'absorbed';
+    if (body.members) body.dead = true;
+  }
+  keepInside(group);
+  groups.push(group);
 }
 
-function canMerge(a, b, relaxed) {
-  return a !== b && !(a.nextMerge > clock || b.nextMerge > clock) &&
-    (relaxed || Math.min(a.members?.length || 1, b.members?.length || 1) * 3 >=
-      Math.max(a.members?.length || 1, b.members?.length || 1));
+function contactBodies(a, b, down, allowMerge) {
+  const dx = b.x - a.x, dy = b.y - a.y, radius = a.r + b.r;
+  const distanceSquared = dx * dx + dy * dy;
+  if (distanceSquared > radius * radius) return false;
+  const size = (a.members?.length || 1) + (b.members?.length || 1);
+  const closing = (a.vx - b.vx) * dx + (a.vy - b.vy) * dy;
+  // Only circles in real contact can merge. Area and original dots are both retained.
+  if (allowMerge && size <= maxGroupSize && (closing > 0 || distanceSquared < radius ** 2 * .76)) {
+    mergeBodies(a, b);
+    return true;
+  }
+  if (a.impacts && b.impacts) collidePair(a, b, down);
+  return false;
 }
 
-function spit(body) {
-  const dot = body.members.pop();
-  refreshMass(body);
-  const distance = body.r + dot.r;
-  const phase = dot.id * 2.399963 + clock * 2.1;
-  let nx = Math.cos(phase), ny = Math.sin(phase);
-  // Pick an exposed part of the surface when the core is against an edge.
-  for (let i = 0; i < 8; i++) {
-    const bearing = phase + i * tau / 8;
-    const x = Math.cos(bearing), y = Math.sin(bearing);
-    const edgeX = body.x + x * (distance + 2 * dot.r);
-    const edgeY = body.y + y * (distance + 2 * dot.r);
-    if (edgeX < dot.r || edgeX > width - dot.r || edgeY < dot.r || edgeY > height - dot.r) continue;
-    nx = x; ny = y;
-    break;
-  }
-  dot.x = body.x + nx * distance;
-  dot.y = body.y + ny * distance;
-  contain(dot);
-  dot.flightX = dot.flightY = 0;
-  const launch = body.members.length ? Math.sqrt(gravity) * (.72 + .35 * dot.size) : 0;
-  if (!launch) {
-    dot.x = body.x; dot.y = body.y;
-    dot.flightX = body.flightX; dot.flightY = body.flightY;
-  }
-  dot.vx = body.vx + nx * launch;
-  dot.vy = body.vy + ny * launch;
-  dot.reachedTop = false;
-  dot.state = 'free';
-  if (!body.members.length) {
-    if (body === core) core = null;
-    else clusters = clusters.filter(cluster => cluster !== body);
-  }
-}
-
-// At the sideways merge stops, use the wall rebound to set the outgoing
-// direction. The ball then follows ordinary gravity until the next contact.
-function aimRebound(dot, other, gx, gy) {
-  const horizontal = Math.abs(gx) >= Math.abs(gy);
-  const primary = horizontal ? 'x' : 'y';
-  const sideways = horizontal ? 'y' : 'x';
-  const lateralGravity = horizontal ? gy : gx;
-  const lateralLimit = (horizontal ? height : width) * .92;
-  const prediction = {...other};
-  const flight = {...dot};
-  for (let elapsed = step; elapsed < 6; elapsed += step) {
-    bounce(prediction, gx, gy, 0, true);
-    bounce(flight, gx, gy, 0, true);
-    if (elapsed < .16 || Math.abs(prediction[primary] - flight[primary]) > (other.r + dot.r) * .8) continue;
-    const velocity = (prediction[sideways] - dot[sideways]) / elapsed - lateralGravity * elapsed / 2;
-    if (Math.abs(velocity) > lateralLimit) continue;
-    if (horizontal) {
-      dot.vy = velocity;
-      dot.flightY = 0;
-    } else {
-      dot.vx = velocity;
-      dot.flightX = 0;
-    }
-    break;
-  }
-}
-
-function startReturn(dot, glyph, gx, gy) {
-  const point = glyphs[glyph].points[dot.id];
-  const horizontal = Math.abs(gx) > Math.abs(gy);
-  const distance = horizontal ? Math.abs(point.x - dot.x) : Math.abs(point.y - dot.y);
-  const acceleration = horizontal ? gx : gy;
-  const time = Math.sqrt(2 * distance / Math.abs(acceleration));
-  if (time < step) return;
-  dot.vx = (point.x - dot.x) / time - gx * time / 2;
-  dot.vy = (point.y - dot.y) / time - gy * time / 2;
-  dot.landing = {glyph, gx, gy, time, total: time, horizontal,
-    x: dot.x, y: dot.y, vx: dot.vx, vy: dot.vy};
-  dot.flightX = dot.flightY = 0;
-  dot.state = 'returning';
-}
-
-function finishReturn(dot, dt) {
-  const landing = dot.landing;
-  if (landing.time <= dt) {
-    const point = glyphs[landing.glyph].points[dot.id];
-    Object.assign(dot, {x: point.x, y: point.y, vx: 0, vy: 0,
-      state: 'fixed', anchor: landing.glyph, landing: null});
-    return;
-  }
-  landing.time -= dt;
-  const elapsed = landing.total - landing.time;
-  const point = glyphs[landing.glyph].points[dot.id];
-  const release = smooth(ramp(elapsed / landing.total, .64, 1));
-  const arcX = landing.x + (landing.vx + landing.gx * elapsed / 2) * elapsed;
-  const arcY = landing.y + (landing.vy + landing.gy * elapsed / 2) * elapsed;
-  const x = landing.horizontal ? arcX : arcX + (point.x - arcX) * release;
-  const y = landing.horizontal ? arcY + (point.y - arcY) * release : arcY;
-  dot.vx = (x - dot.x) / dt;
-  dot.vy = (y - dot.y) / dt;
-  dot.x = x;
-  dot.y = y;
-  contain(dot);
-}
-
-function gravityDirection(degrees) {
-  const heading = wrap(degrees);
-  if (heading === 0) return {x: 0, y: 1};
-  if (heading === 90) return {x: 1, y: 0};
-  if (heading === 180) return {x: 0, y: -1};
-  if (heading === 270) return {x: -1, y: 0};
-  const radians = heading * Math.PI / 180;
-  return {x: Math.sin(radians), y: Math.cos(radians)};
-}
-
-function coreAtLowSide(degrees) {
-  const side = gravityDirection(degrees).x;
-  return side * (core.x - width / 2) >= width * .16;
-}
-
-function advanceManualAngle() {
-  const direction = Math.sign(target - angle);
-  const atStop = angle % 90 === 0;
-  const ready = atStop && (angle % 180 === 0 ? completeGlyph(wrap(angle) / 180) : stored.length === count);
-  const crossed = direction > 0 ? (Math.floor(angle / 90) + 1) * 90 : (Math.ceil(angle / 90) - 1) * 90;
-  // A fast turn can reach a milestone before its physical transitions finish.
-  const waiting = atStop && !ready && direction === arrivalDirection;
-  const goal = waiting ? angle : direction > 0 ? Math.min(target, crossed) : Math.max(target, crossed);
-  const quarterTurn = crossed % 180 !== 0;
-  const coreReady = core && stored.length === count && clock >= core.nextMerge &&
-    (!quarterTurn || coreAtLowSide(crossed));
-  if (goal !== angle) arrivalDirection = Math.sign(goal - angle);
-  const segment = Math.floor(wrap(angle + direction * .001) / 90);
-  const splitting = direction > 0 ? segment % 2 === 1 : segment % 2 === 0;
-  const angleInHalfTurn = wrap(angle) % 180;
-  const quarterBoost = 1 - smooth(ramp(Math.abs(angleInHalfTurn - 90), 4, 32));
-  const normalTurn = (splitting ? 6.5 : 8) + 2.8 * quarterBoost;
-  const distanceFromStart = Math.min(wrap(angle), 360 - wrap(angle));
-  const leavingStart = Math.abs(angle + direction * .01 - Math.round(angle / 360) * 360) > distanceFromStart;
-  const opening = !splitting && leavingStart ? smooth(ramp(distanceFromStart, 5, 12)) : 1;
-  const towardQuarterTurn = !splitting && direction;
-  const remainingTurn = Math.abs(crossed - angle);
-  const towardText = splitting && direction && remainingTurn <= 18;
-  const textReady = towardText && completeGlyph(wrap(crossed) / 180);
-  const approachingCore = goal % 180 !== 0 && goal % 90 === 0 && !coreReady;
-  const approachingText = towardText && goal % 180 === 0 && !textReady;
-  let turnPace = normalTurn;
-  if (towardQuarterTurn && !coreReady) {
-    const ease = smooth(1 - ramp(remainingTurn, 18, 38));
-    turnPace += (Math.min(remainingTurn / 2.1, normalTurn) - turnPace) * ease;
-  } else if (towardText && !textReady) {
-    const ease = smooth(1 - ramp(remainingTurn, 7, 18));
-    turnPace += (Math.min(2.9, remainingTurn / 1.08) - turnPace) * ease;
-  }
-  const distance = goal - angle;
-  const maxTurn = 1.1 + (turnPace - 1.1) * opening;
-  const requested = Math.sign(distance) * Math.min(maxTurn, Math.sqrt(16 * Math.abs(distance)));
-  turnVelocity += (requested - turnVelocity) * (1 - Math.exp(-step / .24));
-  const limit = Math.abs(distance) * ((approachingCore || approachingText) ? 2 : 1 / step);
-  const travel = clamp(turnVelocity, -limit, limit) * step;
-  if (Math.abs(distance) < .009 && !approachingCore && !approachingText) {
-    angle = goal;
-    turnVelocity = 0;
-  } else {
-    angle += travel;
-  }
-}
-
-function update() {
-  clock += step;
-  if (usingMotion && motionOffset !== null && motionTracks) {
-    updateHeldCore();
-    return;
-  }
-  advanceManualAngle();
-
-  const clusteredCount = core ? stored.length :
-    clusters.reduce((total, body) => total + body.members.length, 0);
-  const quarterDistance = Math.abs(wrap(angle) % 180 - 90);
-  const quarterBoost = 1 - smooth(ramp(quarterDistance, 4, 32));
-  const quadrant = Math.floor(wrap(angle) / 90);
-  const part = (wrap(angle) - quadrant * 90) / 90;
-  const outward = quadrant % 2 === 0;
-  const glyph = quadrant === 1 || quadrant === 2 ? 1 : 0;
-  const towardCore = outward ? part : 1 - part;
-  const openingRelease = .055 * smooth(ramp(towardCore, 0, 10 / 90)) *
-    (1 - smooth(ramp(towardCore, 10 / 90, 27 / 90)));
-  const earlyRelease = .018 * smooth(ramp(towardCore, .08 / 90, 2 / 90)) *
-    (1 - smooth(ramp(towardCore, 4 / 90, 10 / 90)));
-  const releaseLimit = Math.min(1, ramp(towardCore, 0, .83) + openingRelease + earlyRelease);
-  const gathering = outward ? arrivalDirection > 0 : arrivalDirection < 0;
-  const desiredStored = gathering
-    ? Math.floor(count * smooth(ramp(towardCore, .04, .72)))
-    : Math.round(count * (1 - ramp(1 - towardCore, .035, .7)));
-  const glyphDistance = (outward ? part : 1 - part) * 90;
-  const landingZone = glyphDistance <= 10;
-  const landingProgress = 1 - ramp(glyphDistance, 0, 10);
-  const returnRate = 1 + 2.05 * smooth(landingProgress) - .7 * smooth(ramp(landingProgress, .8, 1));
-  const returnSteps = Math.ceil(returnRate);
-  const returnDt = step * returnRate / returnSteps;
-  const gravityAngle = angle;
-  const down = gravityDirection(gravityAngle);
-  const gravityTarget = 1 + .23 * quarterBoost +
-    (!core && gathering ? 1.28 * smooth(ramp(towardCore, .06, .68)) : 0);
-  motionGravity += (gravityTarget - motionGravity) * (1 - Math.exp(-step / .48));
-  const acceleration = gravity * motionGravity;
-  const gx = down.x * acceleration;
-  const gy = down.y * acceleration;
-
-  // Separate the number of eligible dots from the cadence of individual events.
-  nextRelease = Math.max(nextRelease, clock - .012);
-  nextSpit = Math.max(nextSpit, clock);
-  for (const dot of dots) {
-    if (dot.state !== 'fixed' || (dot.anchor === glyph && dot.rank > releaseLimit)) continue;
-    if (nextRelease > clock) break;
-    release(dot);
-    nextRelease += .009 - .0025 * (1 - smooth(ramp(towardCore, 0, 10 / 90)));
-  }
-
-  if (clusteredCount > desiredStored && nextSpit <= clock) {
-    const body = core || clusters.reduce((largest, cluster) =>
-      cluster.mass > largest.mass ? cluster : largest, clusters[0]);
-    if (clock >= body.nextMerge) {
-      spit(body);
-      nextSpit += .024 - .008 * quarterBoost;
-    }
-  }
-
-  if (core) bounce(core, gx, gy, 0, true);
-  const merging = !core && desiredStored > 0 &&
-    (gy === 0 || gathering);
-  const nearMerge = towardCore > .42;
-  const relaxed = nearMerge && clock - lastMerge > .16;
-  const bodies = [...clusters];
-  for (const dot of dots) {
-    if (dot.state === 'returning') {
-      if (!landingZone || dot.landing.glyph !== glyph) {
-        dot.state = 'free';
-        dot.landing = null;
-      } else {
-        finishReturn(dot, step * returnRate);
-        continue;
-      }
-    }
-    if (dot.state === 'free') bodies.push(dot);
-  }
-  const rebounds = [];
+function collideMovingBodies(down, allowMerge) {
+  const bodies = [...groups, ...balls].filter(body => body.state === 'free');
+  let active = bodies.length;
+  const cell = Math.max(18, Math.max(...bodies.map(body => body.r), 1) * 2);
+  const columns = Math.ceil(width / cell) + 2;
+  const buckets = new Map();
   for (const body of bodies) {
-    const canReturn = !body.members && !merging && landingZone && body.rank > releaseLimit;
-    for (let tick = 0; tick < (canReturn ? returnSteps : 1); tick++) {
-      const rebounded = bounce(body, gx, gy, 0, true, canReturn ? returnDt : step);
-      if (!rebounded) continue;
-      if (canReturn && body.reachedTop) {
-        startReturn(body, glyph, gx, gy);
-        if (body.state === 'returning') break;
-      } else if (merging && nearMerge && Math.abs(gy) < Math.abs(gx) * .65) rebounds.push(body);
-    }
-  }
-  if (merging) {
-    const candidates = bodies.filter(body => (body.reachedTop ||
-      (nearMerge && (body.flightX || body.flightY))) && body.state !== 'returning');
-    for (const body of rebounds) {
-      let closest = null, distance = Infinity;
-      for (const other of candidates) {
-        if (!canMerge(body, other, relaxed)) continue;
-        // Select one nearby partner for this rebound.
-        const horizontal = Math.abs(gx) >= Math.abs(gy);
-        const dx = Math.abs(body.x - other.x), dy = Math.abs(body.y - other.y);
-        const gap = horizontal ? dy + dx * .24 : dx + dy * .24;
-        if (gap < distance) { closest = other; distance = gap; }
+    if (body.nextContact > physicsTime || body.emission || body.emissions?.length) continue;
+    const row = Math.floor(body.y / cell) + 1, column = Math.floor(body.x / cell) + 1;
+    for (let dy = -1; dy <= 1 && body.state === 'free'; dy++) {
+      for (let dx = -1; dx <= 1 && body.state === 'free'; dx++) {
+        const adjacent = buckets.get((row + dy) * columns + column + dx);
+        if (!adjacent) continue;
+        for (const other of adjacent) {
+          if (body.nextContact > physicsTime || other.state !== 'free' || other.nextContact > physicsTime) continue;
+          if (contactBodies(body, other, down, allowMerge && active > minMovingBodies)) {
+            active--;
+            break;
+          }
+        }
       }
-      if (closest) aimRebound(body, closest, gx, gy);
     }
+    if (body.state !== 'free') continue;
+    const key = row * columns + column;
+    if (buckets.has(key)) buckets.get(key).push(body);
+    else buckets.set(key, [body]);
+  }
+  groups = groups.filter(group => !group.dead);
+}
 
-    candidates.sort((a, b) => a.x - a.r - (b.x - b.r));
-    const used = new Set();
-    let available = desiredStored - clusteredCount;
-    for (const [index, a] of candidates.entries()) {
-      if (used.has(a)) continue;
-      for (let i = index + 1; i < candidates.length; i++) {
-        const b = candidates[i];
-        if (b.x - b.r > a.x + a.r) break;
-        if (used.has(b) || !canMerge(a, b, relaxed)) continue;
-        if (Math.hypot(a.x - b.x, a.y - b.y) > a.r + b.r) continue;
-        const added = Number(!a.members) + Number(!b.members);
-        if (added > available) continue;
-        mergePair(a, b);
-        available -= added;
-        used.add(a);
-        used.add(b);
-        break;
-      }
+function textIndex(checkpoint) {
+  return wrap(checkpoint) === 180 ? 1 : 0;
+}
+
+function endAt(ball, index) {
+  const point = glyphs[index].points[ball.id];
+  ball.x = point.x;
+  ball.y = point.y;
+  ball.vx = ball.vy = 0;
+  ball.anchor = index;
+  ball.state = 'fixed';
+  ball.route = null;
+  ball.emission = null;
+}
+
+function makeRoute(ball, index, progress, down, targetId = ball.id) {
+  const point = glyphs[index].points[targetId];
+  const distance = Math.hypot(point.x - ball.x, point.y - ball.y);
+  const span = Math.min(width, height);
+  const expectedSeconds = clamp(distance / (span * .64), .16, .62);
+  const tangentLimit = Math.max(ball.r, distance * .48);
+  const speed = Math.hypot(ball.vx, ball.vy);
+  const handleTime = speed ? Math.min(expectedSeconds / 3, tangentLimit / speed) : 0;
+  const lift = Math.min(span * .17, distance * .19);
+  return {
+    index, targetId, start: progress, x: ball.x, y: ball.y,
+    hx: clamp(ball.x + ball.vx * handleTime, ball.r, width - ball.r),
+    hy: clamp(ball.y + ball.vy * handleTime, ball.r, height - ball.r),
+    ax: clamp(point.x - down.x * lift, ball.r, width - ball.r),
+    ay: clamp(point.y - down.y * lift, ball.r, height - ball.r),
+    down, end: Math.max(ball.arrive, progress + .04)
+  };
+}
+
+function followRoute(ball, progress, dt) {
+  const route = ball.route, point = glyphs[route.index].points[route.targetId];
+  const t = range(progress, route.start, Math.min(1, route.end));
+  if (t >= 1 && !ball.members) {
+    endAt(ball, route.index);
+    return;
+  }
+  const landing = ball.hop ? .83 : 1;
+  let x, y;
+  if (t < landing) {
+    const u = t / landing;
+    // Preserve the tangent at departure, then bring the derivative to zero at contact.
+    const eased = u + u * u - u * u * u;
+    const v = 1 - eased;
+    x = v ** 3 * route.x + 3 * v * v * eased * route.hx +
+      3 * v * eased * eased * route.ax + eased ** 3 * point.x;
+    y = v ** 3 * route.y + 3 * v * v * eased * route.hy +
+      3 * v * eased * eased * route.ay + eased ** 3 * point.y;
+  } else {
+    const hop = ball.hop ? ball.hop * ball.r * Math.sin(Math.PI * range(t, landing, 1)) ** 2 : 0;
+    x = point.x - route.down.x * hop;
+    y = point.y - route.down.y * hop;
+  }
+  const speedCap = Math.min(width, height) * 2.3;
+  ball.vx = clamp((x - ball.x) / Math.max(dt, 1 / 240), -speedCap, speedCap);
+  ball.vy = clamp((y - ball.y) / Math.max(dt, 1 / 240), -speedCap, speedCap);
+  ball.x = x;
+  ball.y = y;
+  keepInside(ball);
+}
+
+﻿function setAngle(degrees) {
+  if (Number.isFinite(degrees)) angle = degrees;
+}
+
+function emissionProgress(emission) {
+  return smooth(clamp(Math.max((physicsTime - emission.time) / .34,
+    emission.direction * (angle - emission.angle) / .68), 0, 1));
+}
+
+function emitMember(group, index, progress, down) {
+  const ball = group.members.pop();
+  const point = glyphs[index].points[ball.id];
+  const dx = point.x - group.x, dy = point.y - group.y;
+  const length = Math.hypot(dx, dy) || 1;
+  const surface = group.members.length ? Math.max(0, group.r - ball.r * .25) : 0;
+  ball.x = group.x + dx / length * surface;
+  ball.y = group.y + dy / length * surface;
+  const kick = Math.sqrt(Math.min(width, height)) * .65;
+  ball.vx = group.vx + dx / length * kick;
+  ball.vy = group.vy + dy / length * kick;
+  keepInside(ball);
+  group.mass = Math.max(0, group.mass - ball.r ** 2);
+  group.r = Math.sqrt(group.mass);
+  ball.emission = {time: physicsTime, angle, direction};
+  group.emissions.push(ball);
+  ball.state = 'returning';
+  ball.route = makeRoute(ball, index, Math.min(progress, .97), down);
+  const deadline = .977 + (ball.id % 19) * .00119;
+  ball.route.end = Math.min(deadline, progress + .075 + .093 * Math.min(1, length / (Math.min(width, height) * .55)));
+}
+
+function advanceGroup(group, progress, index, down, gx, gy, force, dt) {
+  group.emissions = group.emissions.filter(ball => ball.emission && emissionProgress(ball.emission) < 1);
+  if (!group.members.length) {
+    if (!group.emissions.length) group.dead = true;
+    return;
+  }
+  if (progress === null || group.route?.index !== index) {
+    group.route = null;
+    group.state = 'free';
+  }
+  if (!group.route) {
+    const previous = group.impacts;
+    advanceBall(group, gx, gy, force, dt);
+    const rank = group.id / Math.max(1, balls.length - 1);
+    const readingOrder = index === 1 ? 1 - rank : rank;
+    const begin = group.begin * .7 + readingOrder * .195;
+    if (progress === null || progress < begin ||
+        (group.impacts === previous && progress < begin + .075) ||
+        (group.swallow && physicsTime < group.swallow.until && progress < .87)) return;
+    const points = glyphs[index].points;
+    const distance = ball => Math.hypot(points[ball.id].x - group.x, points[ball.id].y - group.y);
+    group.members.sort((a, b) => distance(b) - distance(a));
+    group.route = makeRoute(group, index, Math.min(progress, .95), down, group.members.at(-1).id);
+    group.route.end = Math.min(.945, progress + .14);
+    group.splitStart = Math.min(.869, progress + (group.route.end - progress) * .81);
+    group.splitEnd = Math.max(group.splitStart + .016, Math.min(.915, group.splitStart + .115));
+    group.beforeSplit = group.members.length;
+    group.state = 'returning';
+    group.swallow = null;
+  }
+  followRoute(group, progress, dt);
+  if (progress < group.splitStart) return;
+  const fraction = range(progress, group.splitStart, group.splitEnd);
+  const remaining = group.beforeSplit - 1 - Math.floor(fraction * (group.beforeSplit - 1) + 1e-7);
+  while (group.members.length > remaining) emitMember(group, index, progress, down);
+}
+
+function settleCheckpoint(checkpoint, dt) {
+  const index = textIndex(checkpoint), down = gravityDirection(checkpoint);
+  for (const group of groups) for (const ball of group.members) {
+    ball.x = group.x;
+    ball.y = group.y;
+    ball.vx = group.vx;
+    ball.vy = group.vy;
+  }
+  for (const ball of balls) {
+    if (ball.state === 'fixed' && ball.anchor === index) continue;
+    if (ball.route?.index !== index) ball.route = makeRoute(ball, index, 0, down);
+    followRoute(ball, 1, dt);
+  }
+  groups = [];
+}
+
+function update(dt) {
+  if (!balls.length) return;
+  physicsTime += dt;
+  const delta = angle - appliedAngle;
+  const moving = Math.sign(delta);
+  if (moving) direction = moving;
+  const crossed = moving > 0 ? (Math.floor(appliedAngle / 180) + 1) * 180
+    : (Math.ceil(appliedAngle / 180) - 1) * 180;
+  const checkpoint = Math.round(angle / 180) * 180;
+  const isAtText = Math.abs(angle - checkpoint) <= (usingMotion ? .12 : 1e-7);
+  const passedText = moving && moving * (angle - crossed) >= -1e-7;
+  if ((isAtText || passedText) && (moving || settledAt === null)) {
+    settledAt = isAtText ? checkpoint : crossed;
+    settleCheckpoint(settledAt, dt);
+  }
+  appliedAngle = angle;
+  if (isAtText) return;
+  settledAt = null;
+
+  const goal = direction > 0 ? Math.ceil(angle / 180) * 180 : Math.floor(angle / 180) * 180;
+  const distance = Math.abs(goal - angle);
+  const towardText = distance <= returnSpan;
+  const glyph = textIndex(goal);
+  const progress = towardText ? 1 - distance / returnSpan : 0;
+  const down = gravityDirection(angle);
+  const force = gravityStrength();
+  const gx = down.x * force, gy = down.y * force;
+
+  for (const group of groups) advanceGroup(group, towardText ? progress : null, glyph, down, gx, gy, force, dt);
+  groups = groups.filter(group => !group.dead);
+  for (const ball of balls) {
+    if (ball.emission && emissionProgress(ball.emission) >= 1) ball.emission = null;
+    if (ball.state === 'absorbed') continue;
+    if (ball.state === 'fixed') {
+      const away = Math.min(wrap(angle - ball.anchor * 180), wrap(ball.anchor * 180 - angle));
+      if ((towardText && ball.anchor === glyph) || away < ball.release) continue;
+      fall(ball);
+    }
+    if (ball.state === 'returning' && (!towardText || ball.route?.index !== glyph)) fall(ball);
+    if (ball.state === 'returning' && ball.route) {
+      followRoute(ball, progress, dt);
+      continue;
+    }
+    const previous = ball.impacts;
+    advanceBall(ball, gx, gy, force, dt);
+    if (towardText && progress >= ball.begin &&
+        (ball.impacts !== previous || progress >= ball.begin + .085)) {
+      ball.route = makeRoute(ball, glyph, Math.min(progress, .98), down);
+      ball.state = 'returning';
     }
   }
-  if (preview) advancePreview();
+  if (dt > 0) collideMovingBodies(down, !towardText);
+}
+
+function formatAngle() {
+  if (!usingMotion && !preview && Number(slider.value) === 360 && wrap(angle) === 0) return 360;
+  return (Math.round(wrap(angle) * 10) % 3600) / 10;
 }
 
 function draw() {
-  ctx.clearRect(0, 0, width, height);
-  if (usingMotion && motionOffset !== null && motionTracks) {
-    drawMotionTrack();
-    return;
-  }
+  if (!balls.length) return;
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  ctx.clearRect(0, 0, viewWidth, viewHeight);
+  ctx.translate(viewWidth / 2, viewHeight / 2);
+  ctx.rotate(-viewRotation() * Math.PI / 180);
+  ctx.translate(-width / 2, -height / 2);
   ctx.fillStyle = '#fff';
   ctx.beginPath();
-  function circle(x, y, r) { ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, tau); }
-  for (const body of core ? [...clusters, core] : clusters) {
-    const swallow = body.swallow;
-    if (!swallow || clock >= body.nextMerge) {
-      circle(body.x, body.y, body.r);
-      continue;
-    }
-    const progress = smooth(1 - (body.nextMerge - clock) / mergeDuration);
-    circle(body.x, body.y, swallow.previousRadius + (body.r - swallow.previousRadius) * progress);
-    const radius = swallow.radius * Math.sqrt(1 - progress);
-    circle(clamp(body.x + swallow.x * (1 - progress), radius, width - radius),
-      clamp(body.y + swallow.y * (1 - progress), radius, height - radius), radius);
+  function paint(x, y, radius) {
+    if (radius < .02) return;
+    const cx = clamp(x, radius, width - radius), cy = clamp(y, radius, height - radius);
+    ctx.moveTo(cx + radius, cy);
+    ctx.arc(cx, cy, radius, 0, tau);
   }
-  for (const dot of dots) {
-    if (dot.state === 'stored') continue;
-    const anchor = dot.state === 'fixed' ? dot.anchor : dot.landing?.glyph;
-    if (anchor === undefined && !dot.departure) {
-      circle(dot.x, dot.y, dot.r);
-      continue;
+  for (const group of groups) {
+    const swallow = group.swallow;
+    if (swallow && physicsTime < swallow.until) {
+      const eaten = smooth(1 - (swallow.until - physicsTime) / mergeTime);
+      paint(group.x, group.y, Math.sqrt(swallow.mass + swallow.incoming * eaten));
+      paint(group.x + swallow.x * (1 - eaten), group.y + swallow.y * (1 - eaten),
+        Math.sqrt(swallow.incoming * (1 - eaten)));
+    } else {
+      const attached = group.emissions.reduce((mass, ball) => mass +
+        (ball.emission ? ball.r ** 2 * (1 - emissionProgress(ball.emission)) : 0), 0);
+      paint(group.x, group.y, Math.sqrt(group.mass + attached));
     }
-    const glyph = glyphs[anchor ?? dot.departure.glyph];
-    const point = glyph.points[dot.id];
-    const spread = anchor === undefined
-      ? 1 - smooth(clamp((clock - dot.departure.time) / .36, 0, 1))
-      : dot.state === 'returning' ? 1 - smooth(clamp(dot.landing.time / .4, 0, 1)) : 1;
-    const radius = dot.r + (point.inkRadius - dot.r) * spread;
-    circle(dot.x, dot.y, radius);
-    if (!spread) continue;
-    for (const accent of glyph.accents[dot.id]) {
-      circle(dot.x + (accent.x - point.x) * spread,
-        dot.y + (accent.y - point.y) * spread, accent.inkRadius * spread);
-    }
+  }
+  for (const ball of balls) if (ball.state !== 'absorbed') {
+    const fraction = ball.emission ? emissionProgress(ball.emission) : 1;
+    paint(ball.x, ball.y, ball.r * Math.sqrt(fraction));
   }
   ctx.fill();
-  const shown = target > 0 && wrap(target) === 0 ? 360 : wrap(target);
-  if (document.activeElement !== angleInput || preview || usingMotion) angleInput.value = shown;
-  const displayAngle = Math.round(angle);
-  const milestone = wrap(displayAngle);
-  const forming = milestone % 180 === 0 && !completeGlyph(milestone / 180);
-  const approachingQuarter = milestone % 180 === 90 && angle !== displayAngle;
-  const displayed = approachingQuarter ? wrap(displayAngle + Math.sign(angle - displayAngle) * .1)
-    : forming ? wrap(displayAngle - arrivalDirection * .1) : milestone;
-  readout.value = (displayed === 0 && displayAngle > 0 ? 360 : Number(displayed.toFixed(1))) + '°';
-}
-
-function completeGlyph(index) {
-  return dots.every(dot => dot.state === 'fixed' && dot.anchor === index);
+  const shown = formatAngle();
+  if (document.activeElement !== slider || usingMotion || preview) slider.value = shown;
+  readout.value = shown + '°';
 }
 
 function stopPreview() {
   preview = null;
-  pausedPreview = null;
-  playButton.textContent = '播放預覽';
+  play.textContent = '播放預覽';
 }
 
-function advancePreview() {
-  const {stops, index} = preview;
-  const offset = stops[index];
-  const goal = preview.base + offset;
-  if (target !== goal) {
-    const delta = goal - target;
-    const edge = wrap(target) % 180;
-    const boost = 1 - smooth(ramp(Math.abs(edge - 90), 4, 32));
-    const rate = (offset % 180 === 0 ? 6.5 : 8) + 2.8 * boost;
-    target += Math.sign(delta) * Math.min(Math.abs(delta), step * rate);
-    return;
-  }
-  if (angle !== goal || (offset % 180 === 0 ? !completeGlyph((offset / 180) % 2) : stored.length !== count)) return;
-  preview.hold += step;
-  if (preview.hold < (offset % 180 === 0 ? 1.6 : 2.8)) return;
-  if (index === stops.length - 1) stopPreview();
-  else { preview.index++; preview.hold = 0; }
-}
-
-let usingMotion = false, motionOffset = null, lastRaw = null, sensorAngle = 0;
-let calibrationScreen = 0;
-let motionTracks = null, trackPromise = null, trackSize = null, savedManualAngle = 0;
-let heldCore = null, motionShift = null;
-function viewportRotation() {
-  return window.screen?.orientation?.angle ?? window.orientation ?? 0;
-}
-
-function calibrateMotion(zero) {
-  motionOffset = lastRaw === null ? null : sensorAngle - zero;
-  calibrationScreen = viewportRotation();
-  heldCore = motionShift = null;
-  target = zero;
-  if (usingMotion) {
-    angle = zero;
-    turnVelocity = 0;
-  }
-}
-function manual() {
+function useManual() {
   stopPreview();
-  if (usingMotion) angle = target = savedManualAngle;
-  usingMotion = false;
-  heldCore = motionShift = null;
-  if (glyphScreenAngle) resize();
-  motionButton.textContent = '啟用陀螺儀';
-  status.textContent = '拖曳畫面或使用角度滑桿，也可播放預覽';
-}
-angleInput.addEventListener('input', () => { manual(); target = Number(angleInput.value); });
-playButton.addEventListener('click', () => {
-  if (preview) {
-    pausedPreview = preview;
-    preview = null;
-    playButton.textContent = '繼續預覽';
-    return;
+  if (usingMotion) {
+    usingMotion = false;
+    resize();
   }
-  const saved = pausedPreview;
-  manual();
-  preview = saved || {base: Math.round(angle / 360) * 360, stops: [0, 90, 180, 270, 360], index: 0, hold: 0};
-  playButton.textContent = '暫停預覽';
+  motion.textContent = '啟用陀螺儀';
+  motion.setAttribute('aria-pressed', 'false');
+  status.textContent = '拖曳畫面、使用滑桿，或播放預覽';
+}
+
+slider.addEventListener('input', () => {
+  useManual();
+  setAngle(Number(slider.value));
 });
 
-let drag;
 stage.addEventListener('pointerdown', event => {
   if (drag || event.button !== 0) return;
-  manual();
-  drag = {id: event.pointerId, x: event.clientX, start: target};
+  useManual();
+  drag = {id: event.pointerId, x: event.clientX, origin: angle};
   stage.setPointerCapture(event.pointerId);
 });
 stage.addEventListener('pointermove', event => {
-  if (drag?.id === event.pointerId) target = drag.start + (event.clientX - drag.x) * 360 / Math.max(180, width);
+  if (drag?.id === event.pointerId) setAngle(drag.origin + (event.clientX - drag.x) * 360 / Math.max(120, viewWidth));
 });
 for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
   stage.addEventListener(type, event => { if (drag?.id === event.pointerId) drag = null; });
 }
 stage.addEventListener('keydown', event => {
-  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+  if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
   event.preventDefault();
-  manual();
-  target += event.key === 'ArrowRight' ? 15 : -15;
+  useManual();
+  setAngle(angle + (event.key === 'ArrowRight' ? 5 : -5));
 });
 
-﻿function makeSensorTracks(data) {
-  ({width, height, gravity, glyphs} = data);
-  const tracks = [];
-  const transfers = [];
-
-  function capture(landingGlyph) {
-    const values = [];
-    let farthest = 0;
-    const add = (key, x, y, r, ink = 0) => values.push([key, x, y, r, ink]);
-    for (const body of core ? [...clusters, core] : clusters) {
-      const key = count + body.members[0].id;
-      const swallow = body.swallow;
-      if (!swallow || clock >= body.nextMerge) {
-        add(key, body.x, body.y, body.r);
-      } else {
-        const progress = smooth(1 - (body.nextMerge - clock) / mergeDuration);
-        add(key, body.x, body.y, swallow.previousRadius + (body.r - swallow.previousRadius) * progress);
-        const radius = swallow.radius * Math.sqrt(1 - progress);
-        add(key + count, clamp(body.x + swallow.x * (1 - progress), radius, width - radius),
-          clamp(body.y + swallow.y * (1 - progress), radius, height - radius), radius);
-      }
-    }
-    let fixed = 0;
-    for (const dot of dots) {
-      if (dot.state === 'stored') continue;
-      if (dot.state === 'fixed') fixed++;
-      else if (landingGlyph !== null) {
-        const point = glyphs[landingGlyph].points[dot.id];
-        farthest = Math.max(farthest, Math.hypot(dot.x - point.x, dot.y - point.y));
-      }
-      const anchor = dot.state === 'fixed' ? dot.anchor : dot.landing?.glyph;
-      const index = anchor ?? dot.departure?.glyph;
-      const spread = anchor === undefined
-        ? dot.departure ? 1 - smooth(clamp((clock - dot.departure.time) / .36, 0, 1)) : 0
-        : dot.state === 'returning' ? 1 - smooth(clamp(dot.landing.time / .4, 0, 1)) : 1;
-      const r = spread ? dot.r + (glyphs[index].points[dot.id].inkRadius - dot.r) * spread : dot.r;
-      add(dot.id, dot.x, dot.y, r, index === 1 ? -spread : spread);
-    }
-    values.sort((a, b) => a[0] - b[0]);
-    const packed = new Float32Array(values.flat());
-    transfers.push(packed.buffer);
-    return {raw: Math.abs(angle), fixed, farthest, packed};
-  }
-
-  for (const direction of [1, -1]) {
-    dots = data.dots.map(dot => Object.assign({...dot}, glyphs[0].points[dot.id], {
-      anchor: 0, state: 'fixed', vx: 0, vy: 0, departure: null, landing: null
-    }));
-    angle = target = arrivalDirection = turnVelocity = clock = nextRelease = nextSpit = lastMerge = 0;
-    motionGravity = 1;
-    core = null;
-    stored = [];
-    clusters = [];
-    const track = {frames: [], quarters: []};
-    for (let segment = 0; segment < 4; segment++) {
-      const start = segment * 90;
-      const goal = direction * (start + 90);
-      const opening = segment % 2 === 0;
-      const landingGlyph = opening ? null : (start + 90) % 360 / 180;
-      const frames = [capture(landingGlyph)];
-      let done = false;
-      for (let tick = 1; tick <= 120 * 65; tick++) {
-        const speed = opening ? 8 : 6.5;
-        target += direction * Math.min(Math.abs(goal - target), step * speed);
-        if (Math.abs(goal - target) < 1e-6) target = goal;
-        update();
-        done = angle === goal && (opening ? !!core && stored.length === count : completeGlyph((start + 90) % 360 / 180));
-        if (tick % 4 === 0 || done) frames.push(capture(landingGlyph));
-        if (done) break;
-      }
-      if (!done) throw new Error('Animation path could not reach ' + goal + '°');
-
-      const last = frames.length - 1;
-      let pivot = opening
-        ? frames.findIndex(frame => frame.raw >= start + 10)
-        : frames.findIndex(frame => frame.raw >= start + 80 && frame.fixed >= count - 22 &&
-          frame.fixed < count && frame.farthest <= Math.min(width, height) * .23);
-      pivot = clamp(pivot < 0 ? last - 1 : pivot, 1, last - 1);
-      const pivotDegrees = opening ? 10 : 80;
-      for (const [index, frame] of frames.entries()) {
-        if (segment && index === 0) continue;
-        const base = index <= pivot ? 0 : pivotDegrees;
-        const span = index <= pivot ? pivotDegrees : 90 - pivotDegrees;
-        let fraction = index <= pivot ? index / pivot : (index - pivot) / (last - pivot);
-        // Preserve the simulated gravity angle where possible while spreading out milestone waits.
-        if (opening || index <= pivot) {
-          const from = index <= pivot ? frames[0].raw : frames[pivot].raw;
-          const to = index <= pivot ? frames[pivot].raw : frames[last].raw;
-          const measured = ramp(frame.raw, from, to);
-          fraction = measured * .48 + fraction * .52;
-        }
-        frame.degrees = start + base + span * fraction;
-        track.frames.push(frame);
-      }
-      if (opening) track.quarters.push({
-        heading: start + 90, x: core.x, y: core.y, r: core.r,
-        vx: core.vx, vy: core.vy, flightX: core.flightX, flightY: core.flightY
-      });
-    }
-    tracks.push(track);
-  }
-  postMessage(tracks, transfers);
-}
-
-function prepareMotionTracks() {
-  const size = width + 'x' + height;
-  if (trackPromise && trackSize === size) return trackPromise;
-  trackSize = size;
-  const functions = [clamp, ramp, wrap, smooth, refreshMass, release, contain, bounceAxis, bounce,
-    mergePair, canMerge, spit, aimRebound, startReturn, finishReturn, gravityDirection, coreAtLowSide,
-    advanceManualAngle, update, completeGlyph, makeSensorTracks];
-  const local = {width, height, gravity, glyphs};
-  const source = 'const count=' + count + ',step=' + step + ',tau=' + tau +
-    ',mergeDuration=' + mergeDuration + ',usingMotion=false,preview=null;' +
-    'let width,height,gravity,glyphs,dots,angle,target,arrivalDirection,turnVelocity,' +
-    'clock,nextRelease,nextSpit,lastMerge,motionGravity,core,stored,clusters;' +
-    functions.map(fn => /^(clamp|ramp|wrap|smooth)$/.test(fn.name)
-      ? 'const ' + fn.name + '=' + fn.toString() + ';' : fn.toString()).join(String.fromCharCode(10)) +
-    String.fromCharCode(10) + 'self.onmessage=event=>makeSensorTracks(event.data);';
-  const request = new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(new Blob([source], {type: 'text/javascript'}));
-    const worker = new Worker(url);
-    function finish() {
-      worker.terminate();
-      URL.revokeObjectURL(url);
-    }
-    worker.onmessage = event => {
-      finish();
-      resolve({...local, tracks: event.data});
-    };
-    worker.onerror = event => {
-      finish();
-      reject(new Error(event.message || 'Unable to prepare bounce paths'));
-    };
-    worker.postMessage({...local, dots});
-  }).catch(error => {
-    if (trackPromise === request) trackPromise = null;
-    throw error;
-  });
-  trackPromise = request;
-  return request;
-}
-
-function motionFrame() {
-  const track = motionTracks.tracks[angle < 0 ? 1 : 0];
-  let degrees = wrap(Math.abs(angle));
-  const nearest = Math.round(degrees / 90) * 90;
-  if (Math.abs(nearest - degrees) < 1e-6) degrees = nearest;
-  const frames = track.frames;
-  let lo = 0, hi = frames.length - 1;
-  while (hi - lo > 1) {
-    const mid = (lo + hi) >> 1;
-    if (frames[mid].degrees <= degrees) lo = mid;
-    else hi = mid;
-  }
-  const a = frames[lo], b = frames[hi];
-  const fraction = clamp((degrees - a.degrees) / (b.degrees - a.degrees), 0, 1);
-  const quarter = track.quarters.find(item => Math.abs(item.heading - degrees) <= (heldCore ? .22 : .12));
-  return {a, b, degrees, fraction, quarter, track};
-}
-
-function updateHeldCore() {
-  const {quarter, degrees, track} = motionFrame();
-  if (!quarter) {
-    if (heldCore && track === heldCore.track) {
-      motionShift = {heading: heldCore.heading, track,
-        x: heldCore.x - heldCore.startX, y: heldCore.y - heldCore.startY};
-    }
-    heldCore = null;
-    if (motionShift && Math.abs(motionShift.heading - degrees) >= 13) motionShift = null;
+play.addEventListener('click', () => {
+  if (preview) {
+    preview.paused = !preview.paused;
+    play.textContent = preview.paused ? '繼續預覽' : '暫停預覽';
     return;
   }
-  if (!heldCore || heldCore.heading !== quarter.heading || heldCore.track !== track) {
-    heldCore = {...quarter, track, startX: quarter.x, startY: quarter.y};
-    motionShift = null;
-  }
-  const down = gravityDirection(angle);
-  bounceAxis(heldCore, 'x', 'vx', motionTracks.width, down.x * motionTracks.gravity, true, 1, true, step);
-  bounceAxis(heldCore, 'y', 'vy', motionTracks.height, down.y * motionTracks.gravity, true, 1, false, step);
+  useManual();
+  const base = Math.round(angle / 360) * 360;
+  setAngle(base);
+  preview = {base, pause: .9, midpoint: false, paused: false};
+  play.textContent = '暫停預覽';
+});
+function advancePreview(dt) {
+  if (!preview || preview.paused) return;
+  if (preview.pause > 0) { preview.pause -= dt; return; }
+  const midpoint = preview.base + 180, end = preview.base + 360;
+  const goal = preview.midpoint ? end : midpoint;
+  const distance = goal - angle;
+  const offset = angle - (preview.midpoint ? midpoint : preview.base);
+  const speed = Math.min(lerp(2.8, 11, smooth(range(offset, 1, 18))),
+    lerp(3.2, 11, smooth(range(distance, 13, 32))));
+  setAngle(Math.min(goal, angle + speed * dt));
+  if (angle !== goal) return;
+  if (preview.midpoint) stopPreview();
+  else { preview.midpoint = true; preview.pause = 1.4; }
 }
 
-function drawMotionTrack() {
-  const {a, b, degrees, fraction, quarter, track} = motionFrame();
-  const rotation = viewportRotation() - calibrationScreen;
-  const sideways = rotation % 180 !== 0;
-  const w = motionTracks.width, h = motionTracks.height;
-  ctx.save();
-  ctx.translate(width / 2, height / 2);
-  ctx.rotate(-rotation * Math.PI / 180);
-  ctx.scale((sideways ? height : width) / w, (sideways ? width : height) / h);
-  ctx.translate(-w / 2, -h / 2);
-  ctx.fillStyle = '#fff';
-  ctx.beginPath();
-  function circle(x, y, r) {
-    const cx = clamp(x, r, w - r), cy = clamp(y, r, h - r);
-    ctx.moveTo(cx + r, cy);
-    ctx.arc(cx, cy, r, 0, tau);
-  }
-  if (quarter) {
-    const ball = heldCore?.track === track && heldCore.heading === quarter.heading ? heldCore : quarter;
-    circle(ball.x, ball.y, ball.r);
-  } else {
-    const first = a.packed, second = b.packed;
-    const shift = motionShift?.track === track ? 1 - smooth(ramp(Math.abs(motionShift.heading - degrees), 0, 13)) : 0;
-    const dx = shift ? motionShift.x * shift : 0;
-    const dy = shift ? motionShift.y * shift : 0;
-    const mix = (x, y) => x + (y - x) * fraction;
-    function dot(key, x, y, r, ink) {
-      x += dx; y += dy;
-      circle(x, y, r);
-      if (!ink || key >= count) return;
-      const glyph = motionTracks.glyphs[ink < 0 ? 1 : 0];
-      const point = glyph.points[key];
-      const spread = Math.abs(ink);
-      for (const accent of glyph.accents[key]) {
-        circle(x + (accent.x - point.x) * spread, y + (accent.y - point.y) * spread,
-          accent.inkRadius * spread);
-      }
-    }
-    let i = 0, j = 0;
-    while (i < first.length || j < second.length) {
-      const x = first[i] ?? Infinity, y = second[j] ?? Infinity;
-      if (x === y) {
-        dot(x, mix(first[i + 1], second[j + 1]), mix(first[i + 2], second[j + 2]),
-          mix(first[i + 3], second[j + 3]), mix(first[i + 4], second[j + 4]));
-        i += 5; j += 5;
-      } else if (x < y) {
-        if (fraction < .5) dot(x, first[i + 1], first[i + 2], first[i + 3], first[i + 4]);
-        i += 5;
-      } else {
-        if (fraction >= .5) dot(y, second[j + 1], second[j + 2], second[j + 3], second[j + 4]);
-        j += 5;
-      }
-    }
-  }
-  ctx.fill();
-  ctx.restore();
-  const shown = (Math.round(wrap(angle) * 10) % 3600) / 10;
-  angleInput.value = shown;
-  readout.value = shown + '°';
-}
-
-function orientation(event) {
+// Device orientation follows the deployed “比較” scene's projection, zero and time filter.
+function orient(event) {
   if (!Number.isFinite(event.beta) || !Number.isFinite(event.gamma)) return;
-  const pitch = event.beta * Math.PI / 180, roll = event.gamma * Math.PI / 180;
-  const x = Math.cos(pitch) * Math.sin(roll), y = Math.sin(pitch);
-  if (Math.hypot(x, y) < .17) return;
-  // Unwrap physical rotation in the device frame before remapping gravity to the viewport.
-  const raw = Math.atan2(x, y) * 180 / Math.PI;
-  if (lastRaw === null) sensorAngle = raw;
-  else sensorAngle += wrap(raw - lastRaw + 180) - 180;
+  const beta = event.beta * Math.PI / 180, gamma = event.gamma * Math.PI / 180;
+  const gx = Math.cos(beta) * Math.sin(gamma), gy = Math.sin(beta);
+  if (Math.hypot(gx, gy) < .16) {
+    if (usingMotion) status.textContent = '請將平板立起，讓旋轉方向穩定';
+    return;
+  }
+  // Keep the comparison controller timing, with a clockwise-positive dial.
+  const raw = Math.atan2(gx, gy) * 180 / Math.PI;
+  lastEvent = performance.now();
+  if (lastRaw === null) {
+    lastRaw = raw;
+    zero = unwrapped - angle;
+  }
+  unwrapped += ((raw - lastRaw + 540) % 360) - 180;
   lastRaw = raw;
   if (!usingMotion) return;
-  if (motionOffset === null) calibrateMotion(target);
-  // The last event replaces the previous angle; frames never consume an angle queue.
-  angle = target = sensorAngle - motionOffset;
+  const target = unwrapped - zero;
+  const dt = Math.min(100, lastEvent - lastSensorTime || 16);
+  lastSensorTime = lastEvent;
+  const error = target - (filtered ?? target);
+  if (Math.abs(error) > .12) filtered = (filtered ?? target) + error * (1 - Math.exp(-dt / 35));
+  setAngle(filtered ?? target);
   status.textContent = '陀螺儀已啟用';
 }
-window.addEventListener('deviceorientation', orientation);
-motionButton.addEventListener('click', async () => {
-  if (usingMotion) { manual(); return; }
+
+motion.addEventListener('click', async () => {
+  if (usingMotion) { useManual(); return; }
   try {
-    if (!window.DeviceOrientationEvent) throw new Error();
-    if (typeof DeviceOrientationEvent.requestPermission === 'function' && await DeviceOrientationEvent.requestPermission() !== 'granted') throw new Error();
-    motionButton.disabled = true;
-    status.textContent = '正在準備彈跳路徑';
-    motionTracks = await prepareMotionTracks();
+    if (!window.isSecureContext) throw Error('感應需要 HTTPS，請在部署網址開啟。滑桿與拖曳仍可使用。');
+    const Sensor = window.DeviceOrientationEvent;
+    if (!Sensor) throw Error('這個裝置未提供方向感測');
+    if (typeof Sensor.requestPermission === 'function' && await Sensor.requestPermission() !== 'granted') {
+      throw Error('未取得方向感測權限，可使用滑桿或拖曳');
+    }
     stopPreview();
-    savedManualAngle = angle;
     usingMotion = true;
-    calibrateMotion(angle);
-    motionButton.textContent = '停用陀螺儀';
-    status.textContent = '等待感應資料，請將裝置立起並轉動';
+    lastRaw = null;
+    filtered = angle;
+    zero = unwrapped - angle;
+    resize();
+    motion.textContent = '停用陀螺儀';
+    motion.setAttribute('aria-pressed', 'true');
+    status.textContent = '請正立拿穩平板，讓螢幕面向觀眾';
+    setTimeout(() => {
+      if (usingMotion && performance.now() - lastEvent > 2500) status.textContent = '尚未收到方向資料，請確認動作權限';
+    }, 3000);
   } catch (error) {
-    console.error(error);
-    status.textContent = '無法啟用感應，可使用滑桿或拖曳';
-  } finally {
-    motionButton.disabled = false;
+    status.textContent = error.message;
   }
 });
 document.querySelector('#zero').addEventListener('click', () => {
   stopPreview();
-  const zero = Math.round(angle / 360) * 360;
-  calibrateMotion(zero);
-  status.textContent = '已校正目前方向為 0°';
+  zero = unwrapped;
+  filtered = 0;
+  calibrationScreen = screenRotation();
+  setAngle(0);
+  appliedAngle = 0;
+  settledAt = 0;
+  groups = [];
+  for (const ball of balls) endAt(ball, 0);
+  resize();
+  status.textContent = '已將目前方向校正為 0°';
 });
+window.addEventListener('deviceorientation', orient);
+const syncScreenFrame = () => { if (usingMotion) resize(); };
+if (window.screen?.orientation) window.screen.orientation.addEventListener('change', syncScreenFrame);
+else window.addEventListener('orientationchange', syncScreenFrame);
 
 resize();
-new ResizeObserver(() => {
-  if (stage.clientWidth !== width || stage.clientHeight !== height) resize();
-}).observe(stage);
-// Build paths off the UI thread so motion can start promptly after permission.
-if (window.navigator?.maxTouchPoints > 0 && window.DeviceOrientationEvent && window.Worker) {
-  setTimeout(() => { prepareMotionTracks().catch(() => {}); }, 300);
-}
+new ResizeObserver(resize).observe(stage);
 let previous = performance.now(), accumulated = 0;
 function frame(now) {
-  accumulated += clamp((now - previous) / 1000, 0, .055);
+  const elapsed = clamp((now - previous) / 1000, 0, .08);
   previous = now;
-  while (accumulated >= step) { update(); accumulated -= step; }
+  advancePreview(elapsed);
+  accumulated += elapsed;
+  // Consume the newest angle even on a display frame without a physics step.
+  if (accumulated < step && angle !== appliedAngle) update(0);
+  while (accumulated >= step) {
+    update(step);
+    accumulated -= step;
+  }
   draw();
   requestAnimationFrame(frame);
 }
