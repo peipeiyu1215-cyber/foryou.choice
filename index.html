@@ -1,0 +1,692 @@
+<!doctype html>
+<html lang="zh-Hant">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>選擇｜彈力球逐點掉落</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;height:100dvh;display:grid;grid-template-rows:minmax(0,1fr) auto;background:#18191d;color:white;font:15px system-ui,sans-serif;overflow:hidden}
+main{display:grid;place-items:center;container-type:size;min-width:0;min-height:0}
+.tablet{position:relative;width:min(58.5cqw,58.5cqh,780px);aspect-ratio:3 / 4;border:clamp(7px,1.75cqw,21px) solid #282b31;border-radius:clamp(16px,3cqw,38px);background:#000;transform:rotate(var(--tablet-turn,0deg));outline:1px solid #5c616a;box-shadow:0 14px 38px #0008}
+.tablet::after{content:"";position:absolute;top:calc(-1 * clamp(5px,1.2cqw,15px));left:calc(50% - 2px);width:4px;height:4px;background:#9299a4;border-radius:50%;pointer-events:none}
+canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none;cursor:grab}canvas:active{cursor:grabbing}
+footer{display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:8px 12px;padding:8px max(10px,env(safe-area-inset-right)) max(8px,env(safe-area-inset-bottom)) max(10px,env(safe-area-inset-left));background:#141518}
+label{display:flex;align-items:center;gap:8px;flex:1 1 190px;max-width:410px}input{flex:1;min-width:0;accent-color:#fff}output{min-width:5ch;text-align:right;font-variant-numeric:tabular-nums}button{background:#27282e;color:#fff;border:1px solid #62646b;border-radius:6px;padding:7px 10px;font:inherit}small{color:#ccc;text-align:center}button:focus-visible,canvas:focus-visible{outline:2px solid white;outline-offset:-2px}
+</style>
+<main>
+  <div id="tablet" class="tablet">
+    <canvas id="stage" tabindex="0" aria-label="平板旋轉動畫，拖曳或按左右方向鍵旋轉"></canvas>
+  </div>
+</main>
+<footer>
+<label>角度 <input id="angle" type="range" min="0" max="360" step="0.1" value="0"><output id="readout">0°</output></label>
+<button id="play" type="button">播放預覽</button><button id="motion" type="button">啟用陀螺儀</button><button id="zero" type="button">校正 0°</button>
+<small id="status" role="status">拖曳平板或使用角度滑桿，也可播放預覽</small>
+</footer>
+<script>
+'use strict';
+const stage = document.querySelector('#stage');
+const ctx = stage.getContext('2d');
+const tablet = document.querySelector('#tablet');
+const angleInput = document.querySelector('#angle');
+const readout = document.querySelector('#readout');
+const playButton = document.querySelector('#play');
+const motionButton = document.querySelector('#motion');
+const status = document.querySelector('#status');
+const count = 246;
+const step = 1 / 120;
+const tau = 2 * Math.PI;
+const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
+const ramp = (n, start, end) => clamp((n - start) / (end - start), 0, 1);
+const wrap = n => ((n % 360) + 360) % 360;
+const smooth = t => t * t * (3 - 2 * t);
+function random(seed) {
+  return () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296);
+}
+
+const rng = random(9347);
+const dots = Array.from({length: count}, (_, id) => ({
+  id, size: .65 + 1.42 * rng() ** 1.5, rank: rng(), direction: rng() * tau,
+  state: 'fixed', anchor: 0, vx: 0, vy: 0
+}));
+dots.sort((a, b) => a.rank - b.rank).forEach((dot, i) => { dot.rank = (i + 1) / count; });
+let width, height, scale, unit, gravity, glyphs;
+let turnVelocity = 0, motionGravity = 1;
+let target = 0, angle = 0, arrivalDirection = 0, preview = null, pausedPreview = null;
+let core = null, stored = [], clusters = [];
+let lastMerge = 0;
+const mergeDuration = .105;
+let clock = 0, nextRelease = 0, nextSpit = 0;
+
+function makeGlyph(index) {
+  const lines = [['我們都', '決定好了'], ['你就該', '完成', '我的夢想']][index];
+  const font = '400 FONTpx "DFKai-SB", "STKaiti", "Kaiti TC", KaiTi, "Microsoft JhengHei", serif';
+  const tracking = 1.08;
+  const columns = Math.max(...lines.map(line => line.length));
+  const fontSize = Math.min(width * .94 / (columns * tracking), height * .8 / lines.length, 170);
+  const mask = document.createElement('canvas');
+  mask.width = Math.ceil(width);
+  mask.height = Math.ceil(height);
+  const ink = mask.getContext('2d', {willReadFrequently: true});
+  ink.translate(width / 2, height / 2);
+  if (index) ink.rotate(Math.PI);
+  ink.font = font.replace('FONT', fontSize);
+  ink.textAlign = 'center';
+  ink.textBaseline = 'alphabetic';
+  ink.lineJoin = 'round';
+  ink.lineWidth = Math.max(.55, fontSize * .012);
+  for (const [i, line] of lines.entries()) {
+    const metrics = ink.measureText(line);
+    const center = (i - (lines.length - 1) / 2) * fontSize * 1.14;
+    const baseline = center + (metrics.actualBoundingBoxAscent - metrics.actualBoundingBoxDescent) / 2;
+    for (const [column, character] of Array.from(line).entries()) {
+      const x = (column - (line.length - 1) / 2) * fontSize * tracking;
+      ink.strokeText(character, x, baseline);
+      ink.fillText(character, x, baseline);
+    }
+  }
+  const pixels = ink.getImageData(0, 0, mask.width, mask.height).data;
+  const rand = random(8129 + index * 101);
+  const candidates = [];
+  const density = Math.min(1, 3700 / (fontSize ** 2));
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const alpha = pixels[(y * mask.width + x) * 4 + 3];
+      if (alpha > 75 && rand() < density) {
+        candidates.push({x: x + .5, y: y + .5, distance: Infinity,
+          strokeWeight: .72 + .28 * alpha / 255});
+      }
+    }
+  }
+  const points = [];
+  let best = candidates[Math.floor(rand() * candidates.length)];
+  while (best && points.length < Math.round(count * 2.05)) {
+    points.push(best);
+    const chosen = best;
+    best = null;
+    let score = 0;
+    for (const point of candidates) {
+      const dx = chosen.x - point.x, dy = chosen.y - point.y;
+      point.distance = Math.min(point.distance, dx * dx + dy * dy);
+      const value = point.distance * point.strokeWeight;
+      if (value > score) { best = point; score = value; }
+    }
+  }
+  // Very small viewports may contain fewer opaque pixels than particles.
+  // Size each visible stroke dot against both layers so neighboring dots stay distinct.
+  for (const point of points) {
+    let nearest = Infinity;
+    for (const other of points) {
+      if (other === point) continue;
+      nearest = Math.min(nearest, (point.x - other.x) ** 2 + (point.y - other.y) ** 2);
+    }
+    point.inkRadius = Math.min(fontSize * .038, Math.sqrt(nearest) * .41);
+  }
+  const accents = Array.from({length: count}, () => []);
+  for (const accent of points.splice(count)) {
+    let bestIndex = 0, distance = Infinity;
+    for (const [index, point] of points.entries()) {
+      const gap = (point.x - accent.x) ** 2 + (point.y - accent.y) ** 2;
+      if (gap < distance) { bestIndex = index; distance = gap; }
+    }
+    accents[bestIndex].push(accent);
+  }
+  const samples = points.length;
+  while (points.length < count) points.push(points[points.length % samples] ||
+    {x: width / 2, y: height / 2, inkRadius: .6});
+  for (let i = points.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [points[i], points[j]] = [points[j], points[i]];
+    [accents[i], accents[j]] = [accents[j], accents[i]];
+  }
+  const spacing = points.map((point, i) => {
+    let nearest = Infinity;
+    for (let j = 0; j < points.length; j++) {
+      if (i === j) continue;
+      const dx = point.x - points[j].x, dy = point.y - points[j].y;
+      nearest = Math.min(nearest, dx * dx + dy * dy);
+    }
+    return Math.sqrt(nearest);
+  });
+  return {points, spacing, accents, fontSize};
+}
+
+function refreshMass(body) {
+  body.mass = body.members.reduce((total, dot) => total + dot.mass, 0);
+  body.r = Math.sqrt(body.mass);
+}
+
+function resize() {
+  const oldWidth = width, oldHeight = height;
+  width = Math.max(1, stage.clientWidth);
+  height = Math.max(1, stage.clientHeight);
+  scale = Math.min(window.devicePixelRatio || 1, 2);
+  stage.width = Math.round(width * scale);
+  stage.height = Math.round(height * scale);
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  glyphs = [makeGlyph(0), makeGlyph(1)];
+  unit = Math.min(glyphs[0].fontSize, glyphs[1].fontSize) / 22;
+  gravity = Math.min(width, height) * .4;
+  for (const dot of dots) {
+    // Use one radius throughout the motion, sized to keep dots distinct in both glyphs.
+    const spacing = Math.min(...glyphs.map(glyph => glyph.spacing[dot.id]));
+    dot.r = Math.min(unit * dot.size, Math.max(.78, spacing * .485));
+    dot.mass = dot.r ** 2;
+    if (dot.state === 'fixed') Object.assign(dot, glyphs[dot.anchor].points[dot.id]);
+    else if (oldWidth) { dot.x *= width / oldWidth; dot.y *= height / oldHeight; }
+  }
+  if (oldWidth) for (const body of core ? [...clusters, core] : clusters) {
+    body.x *= width / oldWidth;
+    body.y *= height / oldHeight;
+    refreshMass(body);
+    body.swallow = null;
+    contain(body);
+  }
+  for (const dot of dots) if (dot.state === 'returning') {
+    dot.state = 'free';
+    dot.landing = null;
+  }
+  for (const dot of dots) if (dot.state === 'free') contain(dot);
+}
+
+function release(dot) {
+  dot.departure = {glyph: dot.anchor, time: clock};
+  dot.state = 'free';
+  dot.flightX = dot.flightY = 0;
+  dot.reachedTop = false;
+  dot.vx = Math.cos(dot.direction) * 13;
+  dot.vy = Math.sin(dot.direction) * 13;
+}
+
+function contain(body) {
+  body.x = clamp(body.x, body.r, width - body.r);
+  body.y = clamp(body.y, body.r, height - body.r);
+}
+
+function bounceAxis(body, position, velocity, extent, acceleration, free, damping, primary, dt) {
+  const min = body.r, max = extent - body.r;
+  const low = acceleration < 0 ? min : max;
+  const high = acceleration < 0 ? max : min;
+  const gravitySign = Math.sign(acceleration);
+  const flight = position === 'x' ? 'flightX' : 'flightY';
+  if (body[flight] !== gravitySign) body[flight] = 0;
+  const previous = body[velocity];
+  let speed = previous;
+  if (free && speed * gravitySign < 0 && body[flight] === gravitySign) {
+    // Recompute just enough energy to reach the wall as gravity and radius change.
+    const required = Math.sqrt(2 * Math.abs(acceleration) * Math.max(0, Math.abs(body[position] - high) - .35));
+    speed = gravitySign * -required;
+  }
+  const next = (speed + acceleration * dt) * damping;
+  const location = body[position] + (speed + next) * dt / 2;
+  body[position] = clamp(location, min, max);
+  body[velocity] = next;
+
+  if (free && gravitySign) {
+    if (primary && body[flight] === gravitySign && previous * gravitySign < 0 && Math.abs(body[position] - high) < 1) {
+      body.reachedTop = true;
+    }
+    if (body[position] === low && next * gravitySign > 0) {
+      body[flight] = gravitySign;
+      body[velocity] = -gravitySign * Math.sqrt(2 * Math.abs(acceleration) * Math.max(0, max - min - .35));
+      return true;
+    }
+  }
+  if ((location < min && next < 0) || (location > max && next > 0)) {
+    body[velocity] *= free ? -1 : -.65;
+  }
+}
+
+function bounce(body, ax, ay, damping = 0, free = false, dt = step) {
+  const decay = Math.exp(-damping * dt);
+  const horizontal = Math.abs(ax) >= Math.abs(ay);
+  const reboundX = bounceAxis(body, 'x', 'vx', width, ax, free, decay, horizontal, dt);
+  const reboundY = bounceAxis(body, 'y', 'vy', height, ay, free, decay, !horizontal, dt);
+  const mainRebound = horizontal ? reboundX : reboundY;
+  if (mainRebound && ax && ay) {
+    // Lean the outgoing path toward the current up direction at wall contact.
+    if (horizontal) {
+      body.vy = .5 * (body.vy + body.vx * ay / ax);
+      body.flightY = 0;
+    } else {
+      body.vx = .5 * (body.vx + body.vy * ax / ay);
+      body.flightX = 0;
+    }
+  }
+  return mainRebound;
+}
+
+function mergePair(a, b) {
+  const receiver = a.mass >= b.mass ? a : b;
+  const incoming = receiver === a ? b : a;
+  const members = [...(receiver.members || [receiver]), ...(incoming.members || [incoming])];
+  const share = incoming.mass / (receiver.mass + incoming.mass);
+  const body = {
+    x: receiver.x, y: receiver.y,
+    vx: receiver.vx + (incoming.vx - receiver.vx) * share,
+    vy: receiver.vy + (incoming.vy - receiver.vy) * share,
+    flightX: receiver.flightX, flightY: receiver.flightY,
+    reachedTop: true, members, nextMerge: clock + mergeDuration,
+    swallow: {x: incoming.x - receiver.x, y: incoming.y - receiver.y,
+      radius: incoming.r, previousRadius: receiver.r}
+  };
+  refreshMass(body);
+  contain(body);
+  for (const dot of members) dot.state = 'stored';
+  clusters = clusters.filter(cluster => cluster !== a && cluster !== b);
+  if (members.length === count) {
+    core = body;
+    stored = members;
+  } else clusters.push(body);
+  lastMerge = clock;
+}
+
+function canMerge(a, b, relaxed) {
+  return a !== b && !(a.nextMerge > clock || b.nextMerge > clock) &&
+    (relaxed || Math.min(a.members?.length || 1, b.members?.length || 1) * 3 >=
+      Math.max(a.members?.length || 1, b.members?.length || 1));
+}
+
+function spit(body) {
+  const dot = body.members.pop();
+  refreshMass(body);
+  const distance = body.r + dot.r;
+  const phase = dot.id * 2.399963 + clock * 2.1;
+  let nx = Math.cos(phase), ny = Math.sin(phase);
+  // Pick an exposed part of the surface when the core is against an edge.
+  for (let i = 0; i < 8; i++) {
+    const bearing = phase + i * tau / 8;
+    const x = Math.cos(bearing), y = Math.sin(bearing);
+    const edgeX = body.x + x * (distance + 2 * dot.r);
+    const edgeY = body.y + y * (distance + 2 * dot.r);
+    if (edgeX < dot.r || edgeX > width - dot.r || edgeY < dot.r || edgeY > height - dot.r) continue;
+    nx = x; ny = y;
+    break;
+  }
+  dot.x = body.x + nx * distance;
+  dot.y = body.y + ny * distance;
+  contain(dot);
+  dot.flightX = dot.flightY = 0;
+  const launch = body.members.length ? Math.sqrt(gravity) * (.72 + .35 * dot.size) : 0;
+  if (!launch) {
+    dot.x = body.x; dot.y = body.y;
+    dot.flightX = body.flightX; dot.flightY = body.flightY;
+  }
+  dot.vx = body.vx + nx * launch;
+  dot.vy = body.vy + ny * launch;
+  dot.reachedTop = false;
+  dot.state = 'free';
+  if (!body.members.length) {
+    if (body === core) core = null;
+    else clusters = clusters.filter(cluster => cluster !== body);
+  }
+}
+
+// At the sideways merge stops, use the wall rebound to set the outgoing
+// direction. The ball then follows ordinary gravity until the next contact.
+function aimRebound(dot, other, gx, gy) {
+  const prediction = {...other};
+  const flight = {...dot};
+  for (let elapsed = step; elapsed < 6; elapsed += step) {
+    bounce(prediction, gx, gy, 0, true);
+    bounce(flight, gx, gy, 0, true);
+    if (elapsed < .16 || Math.abs(prediction.x - flight.x) > (other.r + dot.r) * .8) continue;
+    const sideways = (prediction.y - dot.y) / elapsed - gy * elapsed / 2;
+    if (Math.abs(sideways) > height * .92) continue;
+    dot.vy = sideways;
+    dot.flightY = 0;
+    break;
+  }
+}
+
+function startReturn(dot, glyph, gx, gy) {
+  const point = glyphs[glyph].points[dot.id];
+  const horizontal = Math.abs(gx) > Math.abs(gy);
+  const distance = horizontal ? Math.abs(point.x - dot.x) : Math.abs(point.y - dot.y);
+  const acceleration = horizontal ? gx : gy;
+  const time = .94 * Math.sqrt(2 * distance / Math.abs(acceleration));
+  if (time < step) return;
+  dot.vx = (point.x - dot.x) / time - gx * time / 2;
+  dot.vy = (point.y - dot.y) / time - gy * time / 2;
+  dot.landing = {glyph, gx, gy, time};
+  dot.flightX = dot.flightY = 0;
+  dot.state = 'returning';
+}
+
+function finishReturn(dot, dt) {
+  const landing = dot.landing;
+  if (landing.time <= dt) {
+    const point = glyphs[landing.glyph].points[dot.id];
+    Object.assign(dot, {x: point.x, y: point.y, vx: 0, vy: 0,
+      state: 'fixed', anchor: landing.glyph, landing: null});
+    return;
+  }
+  const {gx, gy} = landing;
+  dot.x += (dot.vx + gx * dt / 2) * dt;
+  dot.y += (dot.vy + gy * dt / 2) * dt;
+  dot.vx += gx * dt;
+  dot.vy += gy * dt;
+  contain(dot);
+  landing.time -= dt;
+}
+
+function update() {
+  clock += step;
+  const direction = Math.sign(target - angle);
+  const atStop = angle % 90 === 0;
+  const ready = atStop && (angle % 180 === 0 ? completeGlyph(wrap(angle) / 180) : stored.length === count);
+  const crossed = direction > 0 ? (Math.floor(angle / 90) + 1) * 90 : (Math.ceil(angle / 90) - 1) * 90;
+  // A fast turn can reach a milestone before its physical transitions finish.
+  const waiting = atStop && !ready && direction === arrivalDirection;
+  const goal = waiting ? angle : direction > 0 ? Math.min(target, crossed) : Math.max(target, crossed);
+  const clusteredCount = core ? stored.length :
+    clusters.reduce((total, body) => total + body.members.length, 0);
+  const coreReady = core && stored.length === count && clock >= core.nextMerge;
+  if (goal !== angle) arrivalDirection = Math.sign(goal - angle);
+  const segment = Math.floor(wrap(angle + direction * .001) / 90);
+  const splitting = direction > 0 ? segment % 2 === 1 : segment % 2 === 0;
+  const normalTurn = splitting ? 6.5 : 8;
+  const distanceFromStart = Math.min(wrap(angle), 360 - wrap(angle));
+  const leavingStart = Math.abs(angle + direction * .01 - Math.round(angle / 360) * 360) > distanceFromStart;
+  const opening = !splitting && leavingStart ? smooth(ramp(distanceFromStart, 5, 12)) : 1;
+  const towardQuarterTurn = !splitting && direction;
+  const remainingTurn = Math.abs(crossed - angle);
+  const towardText = splitting && direction && remainingTurn <= 18;
+  const textReady = towardText && completeGlyph(wrap(crossed) / 180);
+  const approachingCore = goal % 180 !== 0 && goal % 90 === 0 && !coreReady;
+  const approachingText = towardText && goal % 180 === 0 && !textReady;
+  let turnPace = normalTurn;
+  if (towardQuarterTurn && !coreReady) {
+    const ease = smooth(1 - ramp(remainingTurn, 18, 38));
+    turnPace += (Math.min(remainingTurn / 3, normalTurn) - turnPace) * ease;
+  } else if (towardText && !textReady) {
+    const ease = smooth(1 - ramp(remainingTurn, 7, 18));
+    turnPace += (Math.min(3.2, remainingTurn / .95) - turnPace) * ease;
+  }
+  const distance = goal - angle;
+  const maxTurn = 1.1 + (turnPace - 1.1) * opening;
+  const requested = Math.sign(distance) * Math.min(maxTurn, Math.sqrt(16 * Math.abs(distance)));
+  turnVelocity += (requested - turnVelocity) * (1 - Math.exp(-step / .24));
+  const limit = Math.abs(distance) * ((approachingCore || approachingText) ? 2 : 1 / step);
+  const travel = clamp(turnVelocity, -limit, limit) * step;
+  if (Math.abs(distance) < .009 && !approachingCore && !approachingText) {
+    angle = goal;
+    turnVelocity = 0;
+  } else {
+    angle += travel;
+  }
+  const quadrant = Math.floor(wrap(angle) / 90);
+  const part = (wrap(angle) - quadrant * 90) / 90;
+  const outward = quadrant % 2 === 0;
+  const glyph = quadrant === 1 || quadrant === 2 ? 1 : 0;
+  const towardCore = outward ? part : 1 - part;
+  const releaseLimit = ramp(towardCore, 0, .83);
+  const desiredStored = outward
+    ? Math.floor(count * smooth(ramp(part, .04, .72)))
+    : Math.round(count * (1 - ramp(part, .22, .76)));
+  const glyphDistance = (outward ? part : 1 - part) * 90;
+  const landingZone = glyphDistance <= 10;
+  const landingProgress = 1 - ramp(glyphDistance, 0, 10);
+  const returnRate = 1 + 2.45 * smooth(landingProgress) - .8 * smooth(ramp(landingProgress, .8, 1));
+  const returnSteps = Math.ceil(returnRate);
+  const returnDt = step * returnRate / returnSteps;
+  const radians = angle * Math.PI / 180;
+  const gathering = outward ? arrivalDirection > 0 : arrivalDirection < 0;
+  const gravityTarget = 1 + (!core && gathering ? 1.22 * smooth(ramp(towardCore, .06, .68)) : 0);
+  motionGravity += (gravityTarget - motionGravity) * (1 - Math.exp(-step / .55));
+  const acceleration = gravity * motionGravity;
+  const gx = Math.abs(Math.sin(radians)) < 1e-8 ? 0 : Math.sin(radians) * acceleration;
+  const gy = Math.abs(Math.cos(radians)) < 1e-8 ? 0 : Math.cos(radians) * acceleration;
+
+  // Separate the number of eligible dots from the cadence of individual events.
+  nextRelease = Math.max(nextRelease, clock - .012);
+  nextSpit = Math.max(nextSpit, clock);
+  for (const dot of dots) {
+    if (dot.state !== 'fixed' || (dot.anchor === glyph && dot.rank > releaseLimit)) continue;
+    if (nextRelease > clock) break;
+    release(dot);
+    nextRelease += .009;
+  }
+
+  if (clusteredCount > desiredStored && nextSpit <= clock) {
+    const body = core || clusters.reduce((largest, cluster) =>
+      cluster.mass > largest.mass ? cluster : largest, clusters[0]);
+    if (clock >= body.nextMerge) {
+      spit(body);
+      nextSpit += .024;
+    }
+  }
+
+  if (core) bounce(core, gx, gy, 0, true);
+  const merging = !core && desiredStored > 0 &&
+    (gy === 0 || gathering);
+  const nearMerge = towardCore > .42;
+  const relaxed = nearMerge && clock - lastMerge > .16;
+  const bodies = [...clusters];
+  for (const dot of dots) {
+    if (dot.state === 'returning') {
+      if (!landingZone || dot.landing.glyph !== glyph) {
+        dot.state = 'free';
+        dot.landing = null;
+      } else {
+        finishReturn(dot, step * returnRate);
+        continue;
+      }
+    }
+    if (dot.state === 'free') bodies.push(dot);
+  }
+  const rebounds = [];
+  for (const body of bodies) {
+    const canReturn = !body.members && !merging && landingZone && body.rank > releaseLimit;
+    for (let tick = 0; tick < (canReturn ? returnSteps : 1); tick++) {
+      const rebounded = bounce(body, gx, gy, 0, true, canReturn ? returnDt : step);
+      if (!rebounded) continue;
+      if (canReturn && body.reachedTop) {
+        startReturn(body, glyph, gx, gy);
+        if (body.state === 'returning') break;
+      } else if (merging && nearMerge && Math.abs(gy) < Math.abs(gx) * .65) rebounds.push(body);
+    }
+  }
+  if (merging) {
+    const candidates = bodies.filter(body => (body.reachedTop ||
+      (nearMerge && (body.flightX || body.flightY))) && body.state !== 'returning');
+    for (const body of rebounds) {
+      let closest = null, distance = Infinity;
+      for (const other of candidates) {
+        if (!canMerge(body, other, relaxed)) continue;
+        // Select one nearby partner for this rebound.
+        const gap = Math.abs(body.y - other.y) + Math.abs(body.x - other.x) * .24;
+        if (gap < distance) { closest = other; distance = gap; }
+      }
+      if (closest) aimRebound(body, closest, gx, gy);
+    }
+
+    candidates.sort((a, b) => a.x - a.r - (b.x - b.r));
+    const used = new Set();
+    let available = desiredStored - clusteredCount;
+    for (const [index, a] of candidates.entries()) {
+      if (used.has(a)) continue;
+      for (let i = index + 1; i < candidates.length; i++) {
+        const b = candidates[i];
+        if (b.x - b.r > a.x + a.r) break;
+        if (used.has(b) || !canMerge(a, b, relaxed)) continue;
+        if (Math.hypot(a.x - b.x, a.y - b.y) > a.r + b.r) continue;
+        const added = Number(!a.members) + Number(!b.members);
+        if (added > available) continue;
+        mergePair(a, b);
+        available -= added;
+        used.add(a);
+        used.add(b);
+        break;
+      }
+    }
+  }
+  if (preview) advancePreview();
+}
+
+function draw() {
+  tablet.style.setProperty('--tablet-turn', `${angle}deg`);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  function circle(x, y, r) { ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, tau); }
+  for (const body of core ? [...clusters, core] : clusters) {
+    const swallow = body.swallow;
+    if (!swallow || clock >= body.nextMerge) {
+      circle(body.x, body.y, body.r);
+      continue;
+    }
+    const progress = smooth(1 - (body.nextMerge - clock) / mergeDuration);
+    circle(body.x, body.y, swallow.previousRadius + (body.r - swallow.previousRadius) * progress);
+    const radius = swallow.radius * Math.sqrt(1 - progress);
+    circle(clamp(body.x + swallow.x * (1 - progress), radius, width - radius),
+      clamp(body.y + swallow.y * (1 - progress), radius, height - radius), radius);
+  }
+  for (const dot of dots) {
+    if (dot.state === 'stored') continue;
+    const anchor = dot.state === 'fixed' ? dot.anchor : dot.landing?.glyph;
+    if (anchor === undefined && !dot.departure) {
+      circle(dot.x, dot.y, dot.r);
+      continue;
+    }
+    const glyph = glyphs[anchor ?? dot.departure.glyph];
+    const point = glyph.points[dot.id];
+    const spread = anchor === undefined
+      ? 1 - smooth(clamp((clock - dot.departure.time) / .36, 0, 1))
+      : dot.state === 'returning' ? 1 - smooth(clamp(dot.landing.time / .4, 0, 1)) : 1;
+    const radius = dot.r + (point.inkRadius - dot.r) * spread;
+    circle(dot.x, dot.y, radius);
+    if (!spread) continue;
+    for (const accent of glyph.accents[dot.id]) {
+      circle(dot.x + (accent.x - point.x) * spread,
+        dot.y + (accent.y - point.y) * spread, accent.inkRadius * spread);
+    }
+  }
+  ctx.fill();
+  const shown = target > 0 && wrap(target) === 0 ? 360 : wrap(target);
+  if (document.activeElement !== angleInput || preview || usingMotion) angleInput.value = shown;
+  const displayAngle = Math.round(angle);
+  const milestone = wrap(displayAngle);
+  const forming = milestone % 180 === 0 && !completeGlyph(milestone / 180);
+  const unfinishedMerge = milestone % 180 === 90 &&
+    (!core || stored.length !== count || clock < core.nextMerge) && angle !== displayAngle;
+  const displayed = unfinishedMerge ? wrap(displayAngle + Math.sign(angle - displayAngle) * .1)
+    : forming ? wrap(displayAngle - arrivalDirection * .1) : milestone;
+  readout.value = (displayed === 0 && displayAngle > 0 ? 360 : Number(displayed.toFixed(1))) + '°';
+}
+
+function completeGlyph(index) {
+  return dots.every(dot => dot.state === 'fixed' && dot.anchor === index);
+}
+
+function stopPreview() {
+  preview = null;
+  pausedPreview = null;
+  playButton.textContent = '播放預覽';
+}
+
+function advancePreview() {
+  const {stops, index} = preview;
+  const offset = stops[index];
+  const goal = preview.base + offset;
+  if (target !== goal) {
+    const delta = goal - target;
+    const rate = offset % 180 === 0 ? 6.5 : 8;
+    target += Math.sign(delta) * Math.min(Math.abs(delta), step * rate);
+    return;
+  }
+  if (angle !== goal || (offset % 180 === 0 ? !completeGlyph((offset / 180) % 2) : stored.length !== count)) return;
+  preview.hold += step;
+  if (preview.hold < (offset % 180 === 0 ? 1.6 : 2.8)) return;
+  if (index === stops.length - 1) stopPreview();
+  else { preview.index++; preview.hold = 0; }
+}
+
+let usingMotion = false, motionOffset = null, lastRaw = null, sensorAngle = 0;
+function manual() { stopPreview(); usingMotion = false; motionButton.textContent = '啟用陀螺儀'; status.textContent = '拖曳平板或使用角度滑桿，也可播放預覽'; }
+angleInput.addEventListener('input', () => { manual(); target = Number(angleInput.value); });
+playButton.addEventListener('click', () => {
+  if (preview) {
+    pausedPreview = preview;
+    preview = null;
+    playButton.textContent = '繼續預覽';
+    return;
+  }
+  const saved = pausedPreview;
+  manual();
+  preview = saved || {base: Math.round(angle / 360) * 360, stops: [0, 90, 180, 270, 360], index: 0, hold: 0};
+  playButton.textContent = '暫停預覽';
+});
+
+let drag;
+stage.addEventListener('pointerdown', event => {
+  if (drag || event.button !== 0) return;
+  manual();
+  drag = {id: event.pointerId, x: event.clientX, start: target};
+  stage.setPointerCapture(event.pointerId);
+});
+stage.addEventListener('pointermove', event => {
+  if (drag?.id === event.pointerId) target = drag.start + (event.clientX - drag.x) * 360 / Math.max(180, width);
+});
+for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+  stage.addEventListener(type, event => { if (drag?.id === event.pointerId) drag = null; });
+}
+stage.addEventListener('keydown', event => {
+  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+  event.preventDefault();
+  manual();
+  target += event.key === 'ArrowRight' ? 15 : -15;
+});
+
+function orientation(event) {
+  if (event.beta == null || event.gamma == null) return;
+  const pitch = event.beta * Math.PI / 180, roll = event.gamma * Math.PI / 180;
+  const x = -Math.cos(pitch) * Math.sin(roll), y = Math.sin(pitch);
+  if (Math.hypot(x, y) < .17) return;
+  const raw = Math.atan2(x, y) * 180 / Math.PI - (screen.orientation?.angle ?? window.orientation ?? 0);
+  if (lastRaw === null) sensorAngle = raw;
+  else sensorAngle += wrap(raw - lastRaw + 180) - 180;
+  lastRaw = raw;
+  if (!usingMotion) return;
+  if (motionOffset === null) motionOffset = sensorAngle - target;
+  target = sensorAngle - motionOffset;
+  status.textContent = '陀螺儀已啟用';
+}
+window.addEventListener('deviceorientation', orientation);
+motionButton.addEventListener('click', async () => {
+  if (usingMotion) { manual(); return; }
+  try {
+    if (!window.DeviceOrientationEvent) throw new Error();
+    if (typeof DeviceOrientationEvent.requestPermission === 'function' && await DeviceOrientationEvent.requestPermission() !== 'granted') throw new Error();
+    stopPreview();
+    usingMotion = true;
+    motionOffset = lastRaw === null ? null : sensorAngle - target;
+    motionButton.textContent = '停用陀螺儀';
+    status.textContent = '等待感應資料，請將裝置立起並轉動';
+  } catch {
+    status.textContent = '無法取得感應權限，可使用滑桿或拖曳';
+  }
+});
+document.querySelector('#zero').addEventListener('click', () => {
+  stopPreview();
+  const zero = Math.round(angle / 360) * 360;
+  motionOffset = lastRaw === null ? null : sensorAngle - zero;
+  target = zero;
+  status.textContent = '已校正目前方向為 0°';
+});
+
+resize();
+new ResizeObserver(() => {
+  if (stage.clientWidth !== width || stage.clientHeight !== height) resize();
+}).observe(stage);
+let previous = performance.now(), accumulated = 0;
+function frame(now) {
+  accumulated += clamp((now - previous) / 1000, 0, .055);
+  previous = now;
+  while (accumulated >= step) { update(); accumulated -= step; }
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</html>
