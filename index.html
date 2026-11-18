@@ -427,18 +427,7 @@ function coreAtLowSide(degrees) {
   return side * (core.x - width / 2) >= width * .16;
 }
 
-function update() {
-  clock += step;
-  const motionActive = usingMotion && motionOffset !== null;
-  if (motionActive) {
-    if (viewportRotation() - calibrationScreen !== glyphScreenAngle) resize();
-    const heading = sensorAngle - motionOffset;
-    const difference = heading - motionHeading;
-    const response = .023 - .016 * smooth(ramp(Math.abs(difference), .5, 5));
-    motionHeading = Math.abs(difference) < .035
-      ? heading : motionHeading + difference * (1 - Math.exp(-step / response));
-    target = motionHeading;
-  }
+function advanceManualAngle() {
   const direction = Math.sign(target - angle);
   const atStop = angle % 90 === 0;
   const ready = atStop && (angle % 180 === 0 ? completeGlyph(wrap(angle) / 180) : stored.length === count);
@@ -446,17 +435,15 @@ function update() {
   // A fast turn can reach a milestone before its physical transitions finish.
   const waiting = atStop && !ready && direction === arrivalDirection;
   const goal = waiting ? angle : direction > 0 ? Math.min(target, crossed) : Math.max(target, crossed);
-  const clusteredCount = core ? stored.length :
-    clusters.reduce((total, body) => total + body.members.length, 0);
   const quarterTurn = crossed % 180 !== 0;
   const coreReady = core && stored.length === count && clock >= core.nextMerge &&
-    (!quarterTurn || motionActive || coreAtLowSide(crossed));
+    (!quarterTurn || coreAtLowSide(crossed));
   if (goal !== angle) arrivalDirection = Math.sign(goal - angle);
   const segment = Math.floor(wrap(angle + direction * .001) / 90);
   const splitting = direction > 0 ? segment % 2 === 1 : segment % 2 === 0;
   const angleInHalfTurn = wrap(angle) % 180;
   const quarterBoost = 1 - smooth(ramp(Math.abs(angleInHalfTurn - 90), 4, 32));
-  const normalTurn = (splitting ? 6.5 : 8) + (motionActive ? 5 : 2.8) * quarterBoost;
+  const normalTurn = (splitting ? 6.5 : 8) + 2.8 * quarterBoost;
   const distanceFromStart = Math.min(wrap(angle), 360 - wrap(angle));
   const leavingStart = Math.abs(angle + direction * .01 - Math.round(angle / 360) * 360) > distanceFromStart;
   const opening = !splitting && leavingStart ? smooth(ramp(distanceFromStart, 5, 12)) : 1;
@@ -486,6 +473,20 @@ function update() {
   } else {
     angle += travel;
   }
+}
+
+function update() {
+  clock += step;
+  const motionActive = usingMotion && motionOffset !== null;
+  if (!motionActive) advanceManualAngle();
+  else if (viewportRotation() - calibrationScreen !== glyphScreenAngle) resize();
+
+  const clusteredCount = core ? stored.length :
+    clusters.reduce((total, body) => total + body.members.length, 0);
+  const quarterDistance = Math.abs(wrap(angle) % 180 - 90);
+  const quarterBoost = 1 - smooth(ramp(quarterDistance, 4, 32));
+  const finishingMerge = motionActive && pendingMotionMerge && !core;
+  if (core) pendingMotionMerge = false;
   const quadrant = Math.floor(wrap(angle) / 90);
   const part = (wrap(angle) - quadrant * 90) / 90;
   const outward = quadrant % 2 === 0;
@@ -493,9 +494,9 @@ function update() {
   const towardCore = outward ? part : 1 - part;
   const openingRelease = .055 * smooth(ramp(towardCore, 0, 10 / 90)) *
     (1 - smooth(ramp(towardCore, 10 / 90, 27 / 90)));
-  const releaseLimit = Math.min(1, ramp(towardCore, 0, .83) + openingRelease);
+  const releaseLimit = finishingMerge ? 1 : Math.min(1, ramp(towardCore, 0, .83) + openingRelease);
   const gathering = outward ? arrivalDirection > 0 : arrivalDirection < 0;
-  const desiredStored = gathering
+  const desiredStored = finishingMerge ? count : gathering
     ? Math.floor(count * smooth(ramp(towardCore, .04, .72)))
     : Math.round(count * (1 - ramp(1 - towardCore, .035, .7)));
   const glyphDistance = (outward ? part : 1 - part) * 90;
@@ -504,10 +505,10 @@ function update() {
   const returnRate = 1 + 2.05 * smooth(landingProgress) - .7 * smooth(ramp(landingProgress, .8, 1));
   const returnSteps = Math.ceil(returnRate);
   const returnDt = step * returnRate / returnSteps;
-  const gravityAngle = motionActive ? motionHeading + viewportRotation() - calibrationScreen : angle;
+  const gravityAngle = motionActive ? angle + viewportRotation() - calibrationScreen : angle;
   const down = gravityDirection(gravityAngle);
   const gravityTarget = 1 + .23 * quarterBoost +
-    (!core && gathering ? 1.28 * smooth(ramp(towardCore, .06, .68)) : 0);
+    (finishingMerge ? 1.28 : !core && gathering ? 1.28 * smooth(ramp(towardCore, .06, .68)) : 0);
   motionGravity += (gravityTarget - motionGravity) * (1 - Math.exp(-step / .48));
   const acceleration = gravity * motionGravity;
   const gx = down.x * acceleration;
@@ -534,8 +535,8 @@ function update() {
 
   if (core) bounce(core, gx, gy, 0, true);
   const merging = !core && desiredStored > 0 &&
-    (gy === 0 || gathering);
-  const nearMerge = towardCore > .42;
+    (finishingMerge || gy === 0 || gathering);
+  const nearMerge = finishingMerge || towardCore > .42;
   const relaxed = nearMerge && clock - lastMerge > .16;
   const bodies = [...clusters];
   for (const dot of dots) {
@@ -640,7 +641,7 @@ function draw() {
   }
   ctx.fill();
   if (usingMotion && motionOffset !== null) {
-    const shown = (Math.round(wrap(motionHeading) * 10) % 3600) / 10;
+    const shown = (Math.round(wrap(angle) * 10) % 3600) / 10;
     angleInput.value = shown;
     readout.value = shown + '°';
     return;
@@ -686,7 +687,8 @@ function advancePreview() {
 }
 
 let usingMotion = false, motionOffset = null, lastRaw = null, sensorAngle = 0;
-let motionHeading = 0, calibrationScreen = 0;
+let calibrationScreen = 0, pendingMotionMerge = false;
+let motionTurnDirection = 0, motionTurnExtreme = 0;
 function viewportRotation() {
   return window.screen?.orientation?.angle ?? window.orientation ?? 0;
 }
@@ -694,11 +696,19 @@ function viewportRotation() {
 function calibrateMotion(zero) {
   motionOffset = lastRaw === null ? null : sensorAngle - zero;
   calibrationScreen = viewportRotation();
-  motionHeading = target = zero;
+  pendingMotionMerge = false;
+  motionTurnDirection = 0;
+  motionTurnExtreme = zero;
+  target = zero;
+  if (usingMotion) {
+    angle = zero;
+    turnVelocity = 0;
+  }
 }
 function manual() {
   stopPreview();
   usingMotion = false;
+  pendingMotionMerge = false;
   if (glyphScreenAngle) resize();
   motionButton.textContent = '啟用陀螺儀';
   status.textContent = '拖曳畫面或使用角度滑桿，也可播放預覽';
@@ -749,6 +759,25 @@ function orientation(event) {
   lastRaw = raw;
   if (!usingMotion) return;
   if (motionOffset === null) calibrateMotion(target);
+  const heading = sensorAngle - motionOffset;
+  const direction = Math.sign(heading - angle);
+  if (direction) {
+    const nextQuarter = direction > 0
+      ? Math.floor((angle + 90) / 180) * 180 + 90
+      : Math.ceil((angle - 90) / 180) * 180 - 90;
+    if (!core && direction * (heading - nextQuarter) >= 0) pendingMotionMerge = true;
+    // Sensor jitter must not switch the animation between merging and spitting.
+    const travel = heading - motionTurnExtreme;
+    if (!motionTurnDirection || travel * motionTurnDirection < -1) {
+      motionTurnDirection = Math.sign(travel);
+      motionTurnExtreme = heading;
+    } else if (travel * motionTurnDirection > 0) {
+      motionTurnExtreme = heading;
+    }
+    arrivalDirection = motionTurnDirection;
+  }
+  // One angle drives the readout, gravity and choreography in sensor mode.
+  angle = target = heading;
   status.textContent = '陀螺儀已啟用';
 }
 window.addEventListener('deviceorientation', orientation);
@@ -759,7 +788,7 @@ motionButton.addEventListener('click', async () => {
     if (typeof DeviceOrientationEvent.requestPermission === 'function' && await DeviceOrientationEvent.requestPermission() !== 'granted') throw new Error();
     stopPreview();
     usingMotion = true;
-    calibrateMotion(target);
+    calibrateMotion(angle);
     motionButton.textContent = '停用陀螺儀';
     status.textContent = '等待感應資料，請將裝置立起並轉動';
   } catch {
