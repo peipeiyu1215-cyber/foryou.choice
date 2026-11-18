@@ -44,30 +44,34 @@ const dots = Array.from({length: count}, (_, id) => ({
   state: 'fixed', anchor: 0, vx: 0, vy: 0
 }));
 dots.sort((a, b) => a.rank - b.rank).forEach((dot, i) => { dot.rank = (i + 1) / count; });
-let width, height, scale, unit, gravity, glyphs;
+let width, height, scale, unit, gravity, glyphs, glyphScreenAngle;
 let turnVelocity = 0, motionGravity = 1;
 let target = 0, angle = 0, arrivalDirection = 0, preview = null, pausedPreview = null;
 let core = null, stored = [], clusters = [];
 let lastMerge = 0;
-const mergeDuration = .105;
+const mergeDuration = .086;
 let clock = 0, nextRelease = 0, nextSpit = 0;
 
 function makeGlyph(index) {
   const lines = [['我們都', '決定好了'], ['你就該', '完成', '我的夢想']][index];
   const font = '400 FONTpx "DFKai-SB", "STKaiti", "Kaiti TC", KaiTi, "Microsoft JhengHei", serif';
   const tracking = 1.08;
+  const sideways = glyphScreenAngle % 180 !== 0;
+  const textWidth = sideways ? height : width;
+  const textHeight = sideways ? width : height;
   const columns = Math.max(...lines.map(line => line.length));
-  const fontSize = Math.min(width * .94 / (columns * tracking), height * .8 / lines.length, 170);
+  const fontSize = Math.min(textWidth * .94 / (columns * tracking), textHeight * .8 / lines.length, 170);
   const mask = document.createElement('canvas');
   mask.width = Math.ceil(width);
   mask.height = Math.ceil(height);
   const ink = mask.getContext('2d', {willReadFrequently: true});
   ink.translate(width / 2, height / 2);
+  ink.rotate(-glyphScreenAngle * Math.PI / 180);
   ink.font = font.replace('FONT', fontSize);
   ink.textAlign = 'center';
   ink.textBaseline = 'alphabetic';
   ink.lineJoin = 'round';
-  ink.lineWidth = Math.max(.55, fontSize * .012);
+  ink.lineWidth = Math.max(.55, fontSize * .016);
   for (const [i, line] of lines.entries()) {
     const metrics = ink.measureText(line);
     const center = (i - (lines.length - 1) / 2) * fontSize * 1.14;
@@ -105,15 +109,42 @@ function makeGlyph(index) {
       if (value > score) { best = point; score = value; }
     }
   }
-  // Very small viewports may contain fewer opaque pixels than particles.
-  // Size each visible stroke dot against both layers so neighboring dots stay distinct.
+  // Fill gaps along ink strokes with smaller dots that travel with their nearest particle.
+  const gap = Math.max(2.45, fontSize * .034);
+  const minGap = gap * .79;
+  const grid = new Map();
+  function addStrokeDot(point) {
+    const key = Math.floor(point.x / gap) + ':' + Math.floor(point.y / gap);
+    if (grid.has(key)) grid.get(key).push(point);
+    else grid.set(key, [point]);
+  }
+  for (const point of points) addStrokeDot(point);
+  for (let row = 1; (row + .5) * gap < height - 1; row++) {
+    const y = (row + .5) * gap;
+    for (let x = gap * (row % 2 ? 1 : .5); x < width - 1; x += gap) {
+      if (pixels[(Math.floor(y) * mask.width + Math.floor(x)) * 4 + 3] < 105) continue;
+      const col = Math.floor(x / gap);
+      let clear = true;
+      for (let dy = -1; dy <= 1 && clear; dy++) {
+        for (let dx = -1; dx <= 1 && clear; dx++) {
+          const nearby = grid.get((col + dx) + ':' + (row + dy));
+          clear = !nearby?.some(point => (point.x - x) ** 2 + (point.y - y) ** 2 < minGap ** 2);
+        }
+      }
+      if (!clear) continue;
+      const point = {x, y};
+      points.push(point);
+      addStrokeDot(point);
+    }
+  }
+  // Keep a thin gap between neighboring ink dots, including around dense stroke junctions.
   for (const point of points) {
     let nearest = Infinity;
     for (const other of points) {
       if (other === point) continue;
       nearest = Math.min(nearest, (point.x - other.x) ** 2 + (point.y - other.y) ** 2);
     }
-    point.inkRadius = Math.min(fontSize * .038, Math.sqrt(nearest) * .41);
+    point.inkRadius = Math.min(fontSize * .038, Math.sqrt(nearest) * .458);
   }
   const accents = Array.from({length: count}, () => []);
   for (const accent of points.splice(count)) {
@@ -141,6 +172,13 @@ function makeGlyph(index) {
     }
     return Math.sqrt(nearest);
   });
+  if (index === 1) {
+    // The canvas is the device's screen. After a half turn both screen axes invert.
+    for (const point of new Set([...points, ...accents.flat()])) {
+      point.x = width - point.x;
+      point.y = height - point.y;
+    }
+  }
   return {points, spacing, accents, fontSize};
 }
 
@@ -157,6 +195,7 @@ function resize() {
   stage.width = Math.round(width * scale);
   stage.height = Math.round(height * scale);
   ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  glyphScreenAngle = usingMotion ? viewportRotation() - calibrationScreen : 0;
   glyphs = [makeGlyph(0), makeGlyph(1)];
   unit = Math.min(glyphs[0].fontSize, glyphs[1].fontSize) / 22;
   gravity = Math.min(width, height) * .4;
@@ -318,16 +357,26 @@ function spit(body) {
 // At the sideways merge stops, use the wall rebound to set the outgoing
 // direction. The ball then follows ordinary gravity until the next contact.
 function aimRebound(dot, other, gx, gy) {
+  const horizontal = Math.abs(gx) >= Math.abs(gy);
+  const primary = horizontal ? 'x' : 'y';
+  const sideways = horizontal ? 'y' : 'x';
+  const lateralGravity = horizontal ? gy : gx;
+  const lateralLimit = (horizontal ? height : width) * .92;
   const prediction = {...other};
   const flight = {...dot};
   for (let elapsed = step; elapsed < 6; elapsed += step) {
     bounce(prediction, gx, gy, 0, true);
     bounce(flight, gx, gy, 0, true);
-    if (elapsed < .16 || Math.abs(prediction.x - flight.x) > (other.r + dot.r) * .8) continue;
-    const sideways = (prediction.y - dot.y) / elapsed - gy * elapsed / 2;
-    if (Math.abs(sideways) > height * .92) continue;
-    dot.vy = sideways;
-    dot.flightY = 0;
+    if (elapsed < .16 || Math.abs(prediction[primary] - flight[primary]) > (other.r + dot.r) * .8) continue;
+    const velocity = (prediction[sideways] - dot[sideways]) / elapsed - lateralGravity * elapsed / 2;
+    if (Math.abs(velocity) > lateralLimit) continue;
+    if (horizontal) {
+      dot.vy = velocity;
+      dot.flightY = 0;
+    } else {
+      dot.vx = velocity;
+      dot.flightX = 0;
+    }
     break;
   }
 }
@@ -363,8 +412,33 @@ function finishReturn(dot, dt) {
   landing.time -= dt;
 }
 
+function gravityDirection(degrees) {
+  const heading = wrap(degrees);
+  if (heading === 0) return {x: 0, y: 1};
+  if (heading === 90) return {x: 1, y: 0};
+  if (heading === 180) return {x: 0, y: -1};
+  if (heading === 270) return {x: -1, y: 0};
+  const radians = heading * Math.PI / 180;
+  return {x: Math.sin(radians), y: Math.cos(radians)};
+}
+
+function coreAtLowSide(degrees) {
+  const side = gravityDirection(degrees).x;
+  return side * (core.x - width / 2) >= width * .16;
+}
+
 function update() {
   clock += step;
+  const motionActive = usingMotion && motionOffset !== null;
+  if (motionActive) {
+    if (viewportRotation() - calibrationScreen !== glyphScreenAngle) resize();
+    const heading = sensorAngle - motionOffset;
+    const difference = heading - motionHeading;
+    const response = .023 - .016 * smooth(ramp(Math.abs(difference), .5, 5));
+    motionHeading = Math.abs(difference) < .035
+      ? heading : motionHeading + difference * (1 - Math.exp(-step / response));
+    target = motionHeading;
+  }
   const direction = Math.sign(target - angle);
   const atStop = angle % 90 === 0;
   const ready = atStop && (angle % 180 === 0 ? completeGlyph(wrap(angle) / 180) : stored.length === count);
@@ -374,11 +448,15 @@ function update() {
   const goal = waiting ? angle : direction > 0 ? Math.min(target, crossed) : Math.max(target, crossed);
   const clusteredCount = core ? stored.length :
     clusters.reduce((total, body) => total + body.members.length, 0);
-  const coreReady = core && stored.length === count && clock >= core.nextMerge;
+  const quarterTurn = crossed % 180 !== 0;
+  const coreReady = core && stored.length === count && clock >= core.nextMerge &&
+    (!quarterTurn || motionActive || coreAtLowSide(crossed));
   if (goal !== angle) arrivalDirection = Math.sign(goal - angle);
   const segment = Math.floor(wrap(angle + direction * .001) / 90);
   const splitting = direction > 0 ? segment % 2 === 1 : segment % 2 === 0;
-  const normalTurn = splitting ? 6.5 : 8;
+  const angleInHalfTurn = wrap(angle) % 180;
+  const quarterBoost = 1 - smooth(ramp(Math.abs(angleInHalfTurn - 90), 4, 32));
+  const normalTurn = (splitting ? 6.5 : 8) + (motionActive ? 5 : 2.8) * quarterBoost;
   const distanceFromStart = Math.min(wrap(angle), 360 - wrap(angle));
   const leavingStart = Math.abs(angle + direction * .01 - Math.round(angle / 360) * 360) > distanceFromStart;
   const opening = !splitting && leavingStart ? smooth(ramp(distanceFromStart, 5, 12)) : 1;
@@ -391,10 +469,10 @@ function update() {
   let turnPace = normalTurn;
   if (towardQuarterTurn && !coreReady) {
     const ease = smooth(1 - ramp(remainingTurn, 18, 38));
-    turnPace += (Math.min(remainingTurn / 3, normalTurn) - turnPace) * ease;
+    turnPace += (Math.min(remainingTurn / 2.1, normalTurn) - turnPace) * ease;
   } else if (towardText && !textReady) {
     const ease = smooth(1 - ramp(remainingTurn, 7, 18));
-    turnPace += (Math.min(3.2, remainingTurn / .95) - turnPace) * ease;
+    turnPace += (Math.min(2.9, remainingTurn / 1.08) - turnPace) * ease;
   }
   const distance = goal - angle;
   const maxTurn = 1.1 + (turnPace - 1.1) * opening;
@@ -413,23 +491,27 @@ function update() {
   const outward = quadrant % 2 === 0;
   const glyph = quadrant === 1 || quadrant === 2 ? 1 : 0;
   const towardCore = outward ? part : 1 - part;
-  const releaseLimit = ramp(towardCore, 0, .83);
-  const desiredStored = outward
-    ? Math.floor(count * smooth(ramp(part, .04, .72)))
-    : Math.round(count * (1 - ramp(part, .22, .76)));
+  const openingRelease = .055 * smooth(ramp(towardCore, 0, 10 / 90)) *
+    (1 - smooth(ramp(towardCore, 10 / 90, 27 / 90)));
+  const releaseLimit = Math.min(1, ramp(towardCore, 0, .83) + openingRelease);
+  const gathering = outward ? arrivalDirection > 0 : arrivalDirection < 0;
+  const desiredStored = gathering
+    ? Math.floor(count * smooth(ramp(towardCore, .04, .72)))
+    : Math.round(count * (1 - ramp(1 - towardCore, .035, .7)));
   const glyphDistance = (outward ? part : 1 - part) * 90;
   const landingZone = glyphDistance <= 10;
   const landingProgress = 1 - ramp(glyphDistance, 0, 10);
-  const returnRate = 1 + 2.45 * smooth(landingProgress) - .8 * smooth(ramp(landingProgress, .8, 1));
+  const returnRate = 1 + 2.05 * smooth(landingProgress) - .7 * smooth(ramp(landingProgress, .8, 1));
   const returnSteps = Math.ceil(returnRate);
   const returnDt = step * returnRate / returnSteps;
-  const radians = angle * Math.PI / 180;
-  const gathering = outward ? arrivalDirection > 0 : arrivalDirection < 0;
-  const gravityTarget = 1 + (!core && gathering ? 1.22 * smooth(ramp(towardCore, .06, .68)) : 0);
-  motionGravity += (gravityTarget - motionGravity) * (1 - Math.exp(-step / .55));
+  const gravityAngle = motionActive ? motionHeading + viewportRotation() - calibrationScreen : angle;
+  const down = gravityDirection(gravityAngle);
+  const gravityTarget = 1 + .23 * quarterBoost +
+    (!core && gathering ? 1.28 * smooth(ramp(towardCore, .06, .68)) : 0);
+  motionGravity += (gravityTarget - motionGravity) * (1 - Math.exp(-step / .48));
   const acceleration = gravity * motionGravity;
-  const gx = Math.abs(Math.sin(radians)) < 1e-8 ? 0 : Math.sin(radians) * acceleration;
-  const gy = Math.abs(Math.cos(radians)) < 1e-8 ? 0 : Math.cos(radians) * acceleration;
+  const gx = down.x * acceleration;
+  const gy = down.y * acceleration;
 
   // Separate the number of eligible dots from the cadence of individual events.
   nextRelease = Math.max(nextRelease, clock - .012);
@@ -446,7 +528,7 @@ function update() {
       cluster.mass > largest.mass ? cluster : largest, clusters[0]);
     if (clock >= body.nextMerge) {
       spit(body);
-      nextSpit += .024;
+      nextSpit += .024 - .008 * quarterBoost;
     }
   }
 
@@ -477,7 +559,7 @@ function update() {
       if (canReturn && body.reachedTop) {
         startReturn(body, glyph, gx, gy);
         if (body.state === 'returning') break;
-      } else if (merging && nearMerge && Math.abs(gy) < Math.abs(gx) * .65) rebounds.push(body);
+      } else if (merging && nearMerge && (motionActive || Math.abs(gy) < Math.abs(gx) * .65)) rebounds.push(body);
     }
   }
   if (merging) {
@@ -488,7 +570,9 @@ function update() {
       for (const other of candidates) {
         if (!canMerge(body, other, relaxed)) continue;
         // Select one nearby partner for this rebound.
-        const gap = Math.abs(body.y - other.y) + Math.abs(body.x - other.x) * .24;
+        const horizontal = Math.abs(gx) >= Math.abs(gy);
+        const dx = Math.abs(body.x - other.x), dy = Math.abs(body.y - other.y);
+        const gap = horizontal ? dy + dx * .24 : dx + dy * .24;
         if (gap < distance) { closest = other; distance = gap; }
       }
       if (closest) aimRebound(body, closest, gx, gy);
@@ -555,14 +639,19 @@ function draw() {
     }
   }
   ctx.fill();
+  if (usingMotion && motionOffset !== null) {
+    const shown = (Math.round(wrap(motionHeading) * 10) % 3600) / 10;
+    angleInput.value = shown;
+    readout.value = shown + '°';
+    return;
+  }
   const shown = target > 0 && wrap(target) === 0 ? 360 : wrap(target);
   if (document.activeElement !== angleInput || preview || usingMotion) angleInput.value = shown;
   const displayAngle = Math.round(angle);
   const milestone = wrap(displayAngle);
   const forming = milestone % 180 === 0 && !completeGlyph(milestone / 180);
-  const unfinishedMerge = milestone % 180 === 90 &&
-    (!core || stored.length !== count || clock < core.nextMerge) && angle !== displayAngle;
-  const displayed = unfinishedMerge ? wrap(displayAngle + Math.sign(angle - displayAngle) * .1)
+  const approachingQuarter = milestone % 180 === 90 && angle !== displayAngle;
+  const displayed = approachingQuarter ? wrap(displayAngle + Math.sign(angle - displayAngle) * .1)
     : forming ? wrap(displayAngle - arrivalDirection * .1) : milestone;
   readout.value = (displayed === 0 && displayAngle > 0 ? 360 : Number(displayed.toFixed(1))) + '°';
 }
@@ -583,7 +672,9 @@ function advancePreview() {
   const goal = preview.base + offset;
   if (target !== goal) {
     const delta = goal - target;
-    const rate = offset % 180 === 0 ? 6.5 : 8;
+    const edge = wrap(target) % 180;
+    const boost = 1 - smooth(ramp(Math.abs(edge - 90), 4, 32));
+    const rate = (offset % 180 === 0 ? 6.5 : 8) + 2.8 * boost;
     target += Math.sign(delta) * Math.min(Math.abs(delta), step * rate);
     return;
   }
@@ -595,7 +686,23 @@ function advancePreview() {
 }
 
 let usingMotion = false, motionOffset = null, lastRaw = null, sensorAngle = 0;
-function manual() { stopPreview(); usingMotion = false; motionButton.textContent = '啟用陀螺儀'; status.textContent = '拖曳畫面或使用角度滑桿，也可播放預覽'; }
+let motionHeading = 0, calibrationScreen = 0;
+function viewportRotation() {
+  return window.screen?.orientation?.angle ?? window.orientation ?? 0;
+}
+
+function calibrateMotion(zero) {
+  motionOffset = lastRaw === null ? null : sensorAngle - zero;
+  calibrationScreen = viewportRotation();
+  motionHeading = target = zero;
+}
+function manual() {
+  stopPreview();
+  usingMotion = false;
+  if (glyphScreenAngle) resize();
+  motionButton.textContent = '啟用陀螺儀';
+  status.textContent = '拖曳畫面或使用角度滑桿，也可播放預覽';
+}
 angleInput.addEventListener('input', () => { manual(); target = Number(angleInput.value); });
 playButton.addEventListener('click', () => {
   if (preview) {
@@ -631,17 +738,17 @@ stage.addEventListener('keydown', event => {
 });
 
 function orientation(event) {
-  if (event.beta == null || event.gamma == null) return;
+  if (!Number.isFinite(event.beta) || !Number.isFinite(event.gamma)) return;
   const pitch = event.beta * Math.PI / 180, roll = event.gamma * Math.PI / 180;
-  const x = -Math.cos(pitch) * Math.sin(roll), y = Math.sin(pitch);
+  const x = Math.cos(pitch) * Math.sin(roll), y = Math.sin(pitch);
   if (Math.hypot(x, y) < .17) return;
-  const raw = Math.atan2(x, y) * 180 / Math.PI - (screen.orientation?.angle ?? window.orientation ?? 0);
+  // Unwrap physical rotation in the device frame before remapping gravity to the viewport.
+  const raw = Math.atan2(x, y) * 180 / Math.PI;
   if (lastRaw === null) sensorAngle = raw;
   else sensorAngle += wrap(raw - lastRaw + 180) - 180;
   lastRaw = raw;
   if (!usingMotion) return;
-  if (motionOffset === null) motionOffset = sensorAngle - target;
-  target = sensorAngle - motionOffset;
+  if (motionOffset === null) calibrateMotion(target);
   status.textContent = '陀螺儀已啟用';
 }
 window.addEventListener('deviceorientation', orientation);
@@ -652,7 +759,7 @@ motionButton.addEventListener('click', async () => {
     if (typeof DeviceOrientationEvent.requestPermission === 'function' && await DeviceOrientationEvent.requestPermission() !== 'granted') throw new Error();
     stopPreview();
     usingMotion = true;
-    motionOffset = lastRaw === null ? null : sensorAngle - target;
+    calibrateMotion(target);
     motionButton.textContent = '停用陀螺儀';
     status.textContent = '等待感應資料，請將裝置立起並轉動';
   } catch {
@@ -662,8 +769,7 @@ motionButton.addEventListener('click', async () => {
 document.querySelector('#zero').addEventListener('click', () => {
   stopPreview();
   const zero = Math.round(angle / 360) * 360;
-  motionOffset = lastRaw === null ? null : sensorAngle - zero;
-  target = zero;
+  calibrateMotion(zero);
   status.textContent = '已校正目前方向為 0°';
 });
 
